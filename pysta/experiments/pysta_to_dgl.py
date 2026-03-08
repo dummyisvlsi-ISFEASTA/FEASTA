@@ -186,7 +186,7 @@ def benchmark_pysta_to_dgl(pysta_path, output_path=None, design_name=None, devic
     results = {}
     
     print("\n" + "="*60)
-    print("PySTA → DGL Conversion Benchmark")
+    print("PySTA -> DGL Conversion Benchmark")
     print("="*60)
     
     # Step 1: Load with PySTA
@@ -195,7 +195,7 @@ def benchmark_pysta_to_dgl(pysta_path, output_path=None, design_name=None, devic
     design = Design(pysta_path, name=design_name, lazy_topology=True, verbose=True)
     t_load = time.time() - t0
     results['pysta_load_time'] = t_load
-    print(f"    ✓ PySTA load time: {t_load:.2f}s")
+    print(f"  [INFO] PySTA load time: {t_load:.2f}s")
     
     # Step 2: Convert to DGL
     print("\n[2] Converting to DGL graph...")
@@ -203,7 +203,7 @@ def benchmark_pysta_to_dgl(pysta_path, output_path=None, design_name=None, devic
     graph = pysta_to_dgl_graph(design, device=device, verbose=True)
     t_convert = time.time() - t0
     results['dgl_convert_time'] = t_convert
-    print(f"    ✓ DGL conversion time: {t_convert:.2f}s")
+    print(f"  [INFO] DGL conversion time: {t_convert:.2f}s")
     
     # Step 3: Save graph (optional)
     if output_path:
@@ -213,8 +213,8 @@ def benchmark_pysta_to_dgl(pysta_path, output_path=None, design_name=None, devic
         dgl.save_graphs(output_path, graph)
         t_save = time.time() - t0
         results['save_time'] = t_save
-        print(f"    ✓ Save time: {t_save:.2f}s")
-        print(f"    ✓ File size: {os.path.getsize(output_path) / 1024 / 1024:.1f} MB")
+        print(f"  [INFO] Save time: {t_save:.2f}s")
+        print(f"  [INFO] File size: {os.path.getsize(output_path) / 1024 / 1024:.1f} MB")
     
     # Summary
     results['total_time'] = results['pysta_load_time'] + results['dgl_convert_time']

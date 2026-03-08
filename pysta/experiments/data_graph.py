@@ -12,14 +12,14 @@ import os
 import sys
 import time
 
-# Add PySTA to path (relative to project root)
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+# Add PySTA to path
+sys.path.insert(0, '/home/aaditya/OpenSTA_new')
 from pysta import Design
 
 random.seed(8026728)
 
 # Default path to ZipCPU CSVs
-DEFAULT_PYSTA_PATH = './data/zipcpu'
+DEFAULT_PYSTA_PATH = '/DATA2/sagar/opensta_tb/zipcpu'
 
 
 def pysta_to_dgl_graph(design, device='cuda'):

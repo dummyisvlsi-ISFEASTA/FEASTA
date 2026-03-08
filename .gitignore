@@ -28,4 +28,3 @@ doc/messages.txt
 
 # clangd turds
 .cache/
-pysta/tests/zipcpu_verification/src/*.csv

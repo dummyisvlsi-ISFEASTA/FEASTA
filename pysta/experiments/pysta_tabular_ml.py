@@ -243,7 +243,7 @@ def export_tabular_csv(result, output_path):
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
     df_out.to_csv(output_path, index=False)
     
-    print(f"Exported {len(df_out)} samples × {len(result['feature_names'])} features to {output_path}")
+    print(f"Exported {len(df_out)} samples x {len(result['feature_names'])} features to {output_path}")
     print(f"  File size: {os.path.getsize(output_path) / 1024:.1f} KB")
 
 

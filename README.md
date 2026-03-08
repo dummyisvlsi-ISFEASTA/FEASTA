@@ -1,442 +1,303 @@
-# FEASTA: Feature Extraction Framework for Static Timing Analysis
+# Parallax Static Timing Analyzer
 
-**An open-source feature extraction framework extending OpenSTA for scalable, native access to circuit and timing features for Machine Learning workflows.**
+OpenSTA is a gate level static timing verifier. As a stand-alone
+executable it can be used to verify the timing of a design using
+standard file formats.
 
----
+* Verilog netlist
+* Liberty library
+* SDC timing constraints
+* SDF delay annotation
+* SPEF parasitics
+* VCD power acitivies
+* SAIF power acitivies
 
-## Overview
+OpenSTA uses a TCL command interpreter to read the design, specify
+timing constraints and print timing reports.
 
-FEASTA augments the [OpenSTA](https://github.com/parallaxsw/OpenSTA) (v2.7.0) implementation with:
+##### Clocks
+* Generated
+* Latency
+* Source latency (insertion delay)
+* Uncertainty
+* Propagated/Ideal
+* Gated clock checks
+* Multiple frequency clocks
 
-1. **Native C++ Feature Extraction** (`csv/csvWriter.cc`) — Embeds feature extraction directly within the timing engine, bypassing the Tcl interface overhead. Uses internal iterators (`VertexIterator`, `VertexOutEdgeIterator`, `InstancePinIterator`) for O(1) per-object access and single-pass CSV export.
+##### Exception paths
+* False path
+* Multicycle path
+* Min/Max path delay
+* Exception points
+*  -from clock/pin/instance -through pin/net -to clock/pin/instance
+*  Edge specific exception points
+*   -rise_from/-fall_from, -rise_through/-fall_through, -rise_to/-fall_to
 
-2. **SPEF Coordinate Parser** (`csv/SpefParser.hh`) — Extracts physical pin coordinates (X, Y) from SPEF files and injects them into the pin properties CSV.
+##### Delay calculation
+* Integrated Dartu/Menezes/Pileggi RC effective capacitance algorithm
+* External delay calculator API
 
-3. **Tcl Command Interface** (`app/StaMain.cc`) — Registers custom Tcl commands for invoking the C++ extraction layer from the OpenSTA shell.
+##### Analysis
+* Report timing checks -from, -through, -to, multiple paths to endpoint
+* Report delay calculation
+* Check timing setup
 
-4. **PySTA Python Framework** (`pysta/`) — A high-performance Python library that ingests the CSV exports into RAM-resident DataFrames with schema validation, graph topology construction, Django-style query filtering, and ML tensor export.
+##### Timing Engine
+OpenSTA is architected to be easily bolted on to other tools as a
+timing engine.  By using a network adapter, OpenSTA can access the host
+netlist data structures without duplicating them.
 
----
+* Query based incremental update of delays, arrival and required times
+* Simulator to propagate constants from constraints and netlist tie high/low
 
-## Repository Structure
+See doc/OpenSTA.pdf for command documentation.
+See doc/ChangeLog.txt for changes to commands.
+See doc/StaApi.txt for timing engine API documentation.
 
-```
-.
-├── app/
-│   └── StaMain.cc              # Tcl command registration (FEASTA additions)
-├── csv/
-│   ├── csvWriter.cc            # Native C++ feature extraction (core of FEASTA)
-│   ├── csvWriter.hh            # Header for extraction functions
-│   ├── SpefParser.cc           # SPEF coordinate parser implementation
-│   ├── SpefParser.hh           # SPEF parser header
-│   └── CsvWriter.i             # SWIG interface for Tcl bindings
-├── pysta/                      # PySTA Python Framework
-│   ├── __init__.py             # Package entry point
-│   ├── loader.py               # Design Loader (zero-copy CSV ingestion)
-│   ├── query.py                # Query Engine (Django-style filters)
-│   ├── topology.py             # Topology Builder (CSR adjacency, BFS)
-│   ├── export.py               # ML Bridge (TensorBridge, Normalizer)
-│   ├── utils.py                # Schema definitions, validation, utilities
-│   ├── experiments/            # Downstream ML task scripts
-│   │   ├── pysta_tabular_ml.py # Tabular cell delay prediction (XGBoost)
-│   │   ├── pysta_to_dgl.py     # Graph conversion for GNN (DGL)
-│   │   ├── benchmark.py        # Performance benchmarking suite
-│   │   ├── model.py            # TimingGCN model definition
-│   │   ├── train.py            # GNN training script
-│   │   └── data_graph.py       # Graph data utilities
-│   └── tests/                  # Verification tests
-├── examples/                   # Self-contained example designs
-│   ├── example1.v              # Small nangate45 design
-│   ├── nangate45_slow.lib.gz   # Liberty library
-│   └── ...
-├── CMakeLists.txt              # Build system (includes csv/ sources)
-└── README.md                   # Original OpenSTA README
-```
+OpenSTA is dual licensed. It is released under GPL v3 as OpenSTA and
+is also licensed for commerical applications by Parallax Software without
+the GPL's requirements.
 
----
+OpenSTA is open source, meaning the sources are published and can be
+compiled locally.  Derivative works are supported as long as they
+adhere to the GPL license requirements.  However, OpenSTA is not
+supported by a public community of developers as many other open
+source projects are. The copyright and development are exclusive to
+Parallax Software.
 
-## Building FEASTA
+Removing copyright and license notices from OpenSTA sources (or any
+other open source project for that matter) is illegal. This should be
+obvious, but the author of OpenSTA has discovered two different cases
+where the copyright and license were removed from source files that
+were copied.
 
-FEASTA builds as part of the standard OpenSTA compilation. No separate build step is required — the `csv/csvWriter.cc` source is already integrated into `CMakeLists.txt`.
+The official git repository is located at
+https://github.com/parallaxsw/OpenSTA.git. Any forks from this code
+base have not passed extensive regression testing which is not
+publicly available.
+
+## Build from source
+
+OpenSTA is built with CMake.
 
 ### Prerequisites
 
-| Dependency | Minimum Version | Purpose |
-|------------|----------------|---------|
-| CMake | 3.10 | Build system |
-| C++ Compiler | C++17 support | GCC 7+ or Clang 5+ |
-| Tcl | 8.5+ | Shell interface |
-| SWIG | 3.0+ | Tcl bindings generation |
-| Flex | 2.6+ | Lexer generation |
-| Bison | 3.2+ | Parser generation |
-| Eigen3 | 3.x | Matrix operations |
-| zlib | — | Compressed file support |
-| CUDD | (optional) | BDD package |
+The build dependency versions are shown below.  Other versions may
+work, but these are the versions used for development.
 
-**Install on Ubuntu/Debian:**
-
-```bash
-sudo apt-get install cmake gcc g++ tcl-dev swig flex bison \
-    libeigen3-dev zlib1g-dev libreadline-dev
+```
+         Ubuntu   Macos
+        22.04.2   14.5
+cmake    3.24.2    3.29.2
+clang             15.0.0
+gcc      11.4.0
+tcl       8.6      8.6.16
+swig      4.1.0    4.1.1
+bison     3.8.2    3.8.2
+flex      2.6.4    2.6.4
 ```
 
-### Compile
-
-```bash
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
+External library dependencies:
+```
+           Ubuntu   Darwin  License
+eigen       3.4.0   3.4.0   MPL2  required
+cudd        3.0.0   3.0.0   BSD   required
+tclreadline 2.3.8   2.3.8   BSD   optional
+zLib        1.2.5   1.2.8   zlib  optional
 ```
 
-This produces the `build/sta` binary with all FEASTA commands built in.
+The [TCL readline library](https://tclreadline.sourceforge.net/tclreadline.html)
+links the GNU readline library to the TCL interpreter for command line
+editing To enable TCL readline support use the following Cmake option:
+See (https://tclreadline.sourceforge.net/) for TCL readline
+documentation. To change the overly verbose default prompt, add
+something this to your ~/.sta init file:
 
-### Verify Build
-
-```bash
-./build/sta -no_splash -no_init -exit -help
+```
+if { ![catch {package require tclreadline}] } {
+  proc tclreadline::prompt1 {} {
+    return "> "
+  }
+}
 ```
 
----
+The Zlib library is an optional.  If CMake finds libz, OpenSTA can
+read Liberty, Verilog, SDF, SPF, and SPEF files compressed with gzip.
 
-## Usage
+CUDD is a binary decision diageram (BDD) package that is used to
+improve conditional timing arc handling, constant propagation, power
+activity propagation and spice netlist generation.
 
-### Step 1: Generate CSV Files (C++ Extraction)
+CUDD is available
+[here](https://github.com/davidkebo/cudd/blob/main/cudd_versions/cudd-3.0.0.tar.gz).
 
-Create a Tcl script that reads your design files and invokes FEASTA extraction commands:
+Unpack and build CUDD.
 
-```tcl
-# read_and_extract.tcl
-
-# 1. Read design inputs
-read_liberty /path/to/library.lib
-read_verilog /path/to/netlist.v
-link_design <top_module>
-read_spef /path/to/parasitics.spef        # Optional: for pin coordinates
-
-# 2. Apply timing constraints
-create_clock -name clk -period 10 [get_ports clk]
-set_input_delay -clock clk 0 [get_ports -filter "direction == input"]
-set_output_delay -clock clk 0 [get_ports -filter "direction == output"]
-
-# 3. Extract features (FEASTA commands)
-dump_network_nodes                                              # → network_nodes.csv
-dump_network_arcs                                               # → network_arcs.csv
-dump_cell_properties cell_properties.csv                        # → cell_properties.csv
-dump_pin_properties  pin_properties.csv /path/to/parasitics.spef  # → pin_properties.csv (with coords)
+```
+tar xvfz cudd-3.0.0.tar.gz
+cd cudd-3.0.0
+./configure
+make
 ```
 
-Run it:
+You can use the "configure --prefix" option and "make install" to install CUDD
+in a different directory.
 
-```bash
-./build/sta -no_splash -no_init -exit read_and_extract.tcl
+### Building with CMake
+
+Use the following commands to checkout the git repository and build the
+OpenSTA library and excutable.
+
+```
+git clone https://github.com/parallaxsw/OpenSTA.git
+cd OpenSTA
+mkdir build
+cd build
+cmake -DCUDD_DIR=<CUDD_INSTALL_DIR> ..
+make
+```
+The default build type is release to compile optimized code.
+The resulting executable is in `build/sta`.
+The library without a `main()` procedure is `build/libOpenSTA.a`.
+
+Optional CMake variables passed as -D<var>=<value> arguments to CMake are show below.
+
+```
+CMAKE_BUILD_TYPE DEBUG|RELEASE
+CMAKE_CXX_FLAGS - additional compiler flags
+TCL_LIBRARY - path to tcl library
+TCL_HEADER - path to tcl.h
+CUDD_DIR - path to cudd installation
+ZLIB_ROOT - path to zlib
+CMAKE_INSTALL_PREFIX
 ```
 
-This generates four CSV files in the current directory.
+If `TCL_LIBRARY` is specified the CMake script will attempt to locate
+the header from the library path.
 
-### FEASTA Tcl Commands Reference
+The default install directory is `/usr/local`.
+To install in a different directory with CMake use the CMAKE_INSTALL_PREFIX option.
 
-| Command | Output File | Description |
-|---------|-------------|-------------|
-| `dump_network_nodes` | `network_nodes.csv` | All pins/ports with structural attributes and clock domain membership |
-| `dump_network_arcs` | `network_arcs.csv` | All timing arcs (net + cell) with source/sink and arc delays |
-| `dump_cell_properties <file>` | `<file>` | Cell-level attributes: type, area, power, pin counts, timing arc counts |
-| `dump_pin_properties <file> [spef]` | `<file>` | Pin-level timing: slew, slack, capacitance, drive resistance, coordinates |
-| `dump_pin_coords <spef> <file>` | `<file>` | Standalone pin coordinate extraction from SPEF |
-| `get_pin_coords <pin> <spef>` | — | Interactive single-pin coordinate lookup (cached) |
+If you make changes to `CMakeLists.txt` you may need to clean out
+existing CMake cached variable values by deleting all of the
+files in the build directory.
 
----
+## Build with Docker
 
-### Step 2: Load with PySTA (Python)
+An alternative way to build and run OpenSTA is with
+[Docker](https://www.docker.com).  After installing Docker, the
+following command builds a Docker image.
 
-#### Prerequisites
-
-```bash
-pip install pandas numpy scipy
-# Optional for ML tasks:
-pip install torch torch-geometric dgl scikit-learn xgboost
+```
+cd OpenSTA
+docker build --file Dockerfile.ubuntu22.04 --tag opensta_ubuntu22.04 .
 ```
 
-#### Basic Usage
+To run a docker container using the OpenSTA image, use the -v option
+to docker to mount direcories with data to use and -i to run
+interactively.
 
-```python
-from pysta import Design
-
-# Load all 4 CSVs from a directory
-design = Design("/path/to/csv/directory/", name="MyDesign")
-
-# Access DataFrames
-print(f"Nodes: {len(design.nodes)}")
-print(f"Arcs:  {len(design.arcs)}")
-print(f"Cells: {len(design.cells)}")
-
-# Design summary
-print(design.summary())
+```
+docker run -i -v $HOME:/data opensta
 ```
 
-#### Query Engine (Django-Style Filters)
+## Build on Macos/Darwin
 
-```python
-# Find timing violations
-violations = design.pins.filter(SlackWorst_ns__lt=0)
+The XCode versions of Tcl, Flex and Bison cannot be used to build OpenSTA.
+Use Homebrew to install them. The following command installs the tools
+required to build OpenSTA in the Brewfile.
 
-# Multi-condition filter
-critical = design.pins.filter(
-    SlackWorst_ns__lt=0,
-    Capacitance_pf__gt=0.5
-)
-
-# Supported operators: __lt, __lte, __gt, __gte, __eq, __ne,
-#                       __in, __contains, __startswith, __endswith
-
-# O(1) node lookup
-node = design.get_node("instance/pin_name")
-
-# Fanout/Fanin traversal
-fanout_nodes = design.pins.get_fanout("reg/Q", depth=3)
-fanin_nodes  = design.pins.get_fanin("reg/D", depth=3)
-
-# Critical path extraction
-paths = design.pins.get_critical_paths(top_k=10)
-for p in paths:
-    print(f"{p['startpoint']} → {p['endpoint']}: {p['slack']:.3f} ns")
+```
+brew bundle install
 ```
 
-#### Topology Builder
+Set these variables before using cmake to cirumvent the Xcode versions.
 
-```python
-# Build graph topology (lazy — built on first access)
-design._ensure_topology()
-topo = design.topology
-
-# CSR adjacency matrices for O(degree) queries
-print(f"Forward adjacency: {topo.forward_adj.shape}")
-print(f"Backward adjacency: {topo.backward_adj.shape}")
-
-# Cycle detection (Kahn's algorithm)
-has_cycles, breaking_points = topo.detect_cycles()
-
-# Logic depth computation (bidirectional BFS)
-depth_in, depth_out = topo.compute_logic_depth(design.nodes)
-
-# Topology statistics
-stats = topo.get_stats()
-# {'num_nodes', 'num_edges', 'has_cycles', 'max_depth_from_input', ...}
+```
+  # flex/bison override apple version
+  export PATH="$(brew --prefix bison)/bin:${PATH}"
+  export PATH="$(brew --prefix flex)/bin:${PATH}"
+  export CMAKE_INCLUDE_PATH="$(brew --prefix flex)/include"
+  export CMAKE_LIBRARY_PATH="$(brew --prefix flex)/lib;$(brew --prefix bison)/lib"
 ```
 
-#### ML Bridge (Tensor Export)
+Homebrew does not support tclreadline, but the macports system does
+(see https://www.macports.org). 
 
-```python
-from pysta import TensorBridge, Normalizer
+## Install using a package manager
 
-bridge = TensorBridge(
-    nodes_df=design.nodes,
-    arcs_df=design.arcs
-)
+### Guix
 
-# Export to NumPy (for scikit-learn, XGBoost)
-X, y = bridge.to_numpy(
-    features=["SlewRise_ns", "Capacitance_pf"],
-    target="SlackWorst_ns",
-    normalize=True
-)
+OpenSTA is available in the [default repositories](https://hpc.guix.info/package/opensta):
 
-# Export to normalized DataFrame
-df = bridge.to_dataframe(
-    features=["SlewRise_ns", "Capacitance_pf"],
-    normalize=True
-)
-
-# Feature-specific normalization with inverse transform
-normalizer = Normalizer()
-transformed = normalizer.fit_transform(df, columns=["SlewRise_ns"])
-original = normalizer.inverse_transform(transformed["SlewRise_ns"].values, column="SlewRise_ns")
-
-# List available features
-print(bridge.get_available_features())
+```
+  guix install opensta
 ```
 
-#### PyTorch Geometric Export (for GNNs)
+## Bug Reports
 
-```python
-# Requires: pip install torch torch-geometric
-data = bridge.to_pytorch_geometric(
-    node_features=["SlewRise_ns", "Capacitance_pf", "CoordX_um", "CoordY_um"],
-    target="SlackWorst_ns",
-    edge_weight="Delay",
-    normalize=True
-)
-print(f"Nodes: {data.num_nodes}, Edges: {data.num_edges}")
-# Ready for GNN training
-```
+Use the Issues tab on the github repository to report bugs.
 
----
+Each issue/bug should be a separate issue. The subject of the issue
+should be a short description of the problem. Attach a test case to
+reproduce the issue as described below. Issues without test cases are
+unlikely to get a response.
 
-## CSV Schema Reference
+The test case should have a tcl command file recreates the issue named
+run.tcl. If is are more than one command file using the same data
+files, there should be separate command files, run1.tcl, run2.tcl
+etc. The bug report can refer to these command files by name.
 
-### network_nodes.csv (Table II)
+Command files should not have absolute filenames like
+"/home/john/OpenSTA_bug/write_path_spice/dump_spice" in them.
+These obviously are not portable. Use filenames relative to the test
+case directory.
 
-| Column | Type | Description |
-|--------|------|-------------|
-| Name | str | Full hierarchical pin/port name |
-| InstanceName | str | Parent instance name |
-| PinName | str | Pin name within instance |
-| Direction | str | `input`, `output`, or `bidirectional` |
-| IsPort | bool | `1` for top-level port |
-| Type | str | `leaf` or `hierarchical` |
-| IsClockNetwork | bool | `1` if part of clock network |
+The files in the test case should be collected into a directory.
+The contents of the directory should be collected into a compressed
+tarfile.
 
-### network_arcs.csv (Table I)
+## Contributions
 
-| Column | Type | Description |
-|--------|------|-------------|
-| Source | str | Source pin/port of the arc |
-| Sink | str | Sink pin/port of the arc |
-| NetName | str | Connecting net name |
-| Delay | float | Arc delay in ns |
-| ArcType | str | `net` (interconnect) or `cell` (gate) |
-| Delay_Max_RR/RF/FR/FF | float | Per-transition arc delays |
+Contributors must sign the Contributor License Agreement (doc/CLA.txt)
+when submitting pull requests.
 
-### pin_properties.csv (Table IV)
+All contributors should read doc/CodingGuidelines.txt for notes on
+making code that adheres to the existing naming and formatting style.
 
-| Column | Type | Description |
-|--------|------|-------------|
-| FullName | str | Full hierarchical pin name |
-| Direction | str | Pin direction |
-| IsHierarchical | bool | `1` for hierarchical pin |
-| IsRegisterClock | bool | `1` for register clock pin |
-| SlewMaxRise/Fall_ns | float | Max path slew (rise/fall) |
-| SlewMinRise/Fall_ns | float | Min path slew (rise/fall) |
-| SlackMaxRise/Fall_ns | float | Setup slack (rise/fall) |
-| SlackMinRise/Fall_ns | float | Hold slack (rise/fall) |
-| Capacitance_pf | float | Total pin capacitance |
-| DriveResistance_kOhm | float | Drive resistance |
-| Activity | float | Switching activity |
-| ToggleRate_MHz | float | Toggle rate |
-| CoordX_um / CoordY_um | float | Physical coordinates (from SPEF) |
+Contributions that claim 4% performance improvements in OpenROAD flow
+scripts will largely be ignored. Small performance improvements
+simply do not justify the time required to audit and verify the changes.
 
-### cell_properties.csv (Table III)
+Contributions that add dependencies on external libraries like boost,
+abseil and Intel TBB will not be accepted.
 
-| Column | Type | Description |
-|--------|------|-------------|
-| FullInstanceName | str | Full hierarchical instance name |
-| LibertyCell | str | Library cell name |
-| Library | str | Library name |
-| CellType | str | `combinational`, `sequential`, `buffer`, etc. |
-| IsBuffer/IsInverter/IsMemory/IsMacro | bool | Cell classification flags |
-| Area_um2 | float | Cell area |
-| PinCount / InputPinCount / OutputPinCount | int | Pin counts |
-| FanoutLoad / FaninLoad | int | Connectivity counts |
-| LeakagePower_pW / SwitchingPower_pW / InternalPower_pW / TotalPower_pW | float | Power breakdown |
-| SetupTime_ns / HoldTime_ns | float | Sequential cell timing |
-| PropagationDelay_ns / ClkToQDelay_ns | float | Cell delays |
-| TimingArcCount | int | Number of timing arcs |
-| ClockDomains | str | Associated clock domains |
+As the author of OpenSTA I vastly prefer writing code to reviewing
+code.  I don't have the patience to go round after round to correct
+code formatting that is not consistent with the rest of the code.
 
----
+## Authors
 
-## Downstream ML Tasks
+* James Cherry
 
-### 1. Graph-Based Net Delay Prediction (GNN)
-
-Uses `pysta_to_dgl.py` to convert FEASTA CSVs to DGL heterographs for CircuitNet-style GNN training.
-
-```bash
-cd pysta/experiments
-
-# Convert CSVs to DGL graph
-python pysta_to_dgl.py \
-    --pysta_path /path/to/csv/dir \
-    --output_path ./graph/design.bin
-
-# Train TimingGCN model
-python train.py \
-    --data_path /path/to/csv/dir \
-    --checkpoint my_model \
-    --iteration 5000
-```
-
-**Node features:** Normalized coordinates (X, Y), input capacitance, transition slew  
-**Edge target:** Net delay (log-transformed)  
-**Graph format:** DGL heterograph with `net_out` and `net_in` edge types
-
-### 2. Tabular Cell Delay Regression (XGBoost)
-
-Uses `pysta_tabular_ml.py` to preprocess cell properties for gradient boosted decision tree models.
-
-```bash
-cd pysta/experiments
-
-python pysta_tabular_ml.py \
-    --pysta_path /path/to/csv/dir \
-    --output tabular_ml_ready.csv
-```
-
-**Features:** Area, pin counts, capacitance, drive strength, fanout/fanin, boolean flags (IsBuffer, IsSequential, etc.)  
-**Target:** Propagation delay (combinational) or Clock-to-Q delay (sequential)  
-**Preprocessing:** Log-scaling for power-law features, boolean encoding, NaN handling
-
-### 3. Performance Benchmarking
-
-```bash
-cd pysta/experiments
-python benchmark.py --pysta_path /path/to/csv/dir --device auto
-```
-
----
-
-## Quick Start Example
-
-Using the self-contained nangate45 example included in the repository:
-
-```bash
-# 1. Build
-mkdir build && cd build && cmake .. && make -j$(nproc) && cd ..
-
-# 2. Generate CSVs
-cd examples
-../build/sta -no_splash -no_init -exit -cmd "
-  read_liberty nangate45_slow.lib.gz
-  read_verilog example1.v
-  link_design top
-  create_clock -name clk -period 10 {clk1 clk2}
-  set_input_delay -clock clk 0 {in1 sel}
-  dump_network_nodes
-  dump_network_arcs
-  dump_cell_properties cell_properties.csv
-  dump_pin_properties pin_properties.csv
-"
-
-# 3. Load with PySTA
-python3 -c "
-import sys; sys.path.insert(0, '..')
-from pysta import Design
-d = Design('.', name='example', verbose=True)
-print(d.summary())
-print('Ports:', len(d.pins.filter(IsPort=True)))
-"
-
-# 4. Clean up
-rm -f network_nodes.csv network_arcs.csv cell_properties.csv pin_properties.csv
-cd ..
-```
-
----
-
-## Files Modified from Base OpenSTA
-
-| File | Change Type | Description |
-|------|-------------|-------------|
-| `app/StaMain.cc` | Modified | Added FEASTA Tcl command registration (`registerNetworkGraphCmds`) |
-| `csv/csvWriter.cc` | **New** | Core C++ feature extraction module (~1475 lines) |
-| `csv/csvWriter.hh` | **New** | Header for extraction functions |
-| `csv/SpefParser.cc` | **New** | SPEF coordinate parser |
-| `csv/SpefParser.hh` | **New** | SPEF parser header with inline implementation |
-| `csv/CsvWriter.i` | **New** | SWIG interface for Tcl bindings |
-| `CMakeLists.txt` | Modified | Added `csv/csvWriter.cc` to `STA_SOURCE`, `csv/` to include paths |
-| `pysta/` | **New** | Entire PySTA Python framework (7 modules + experiments) |
-
----
+* William Scott authored the arnoldi delay calculator at Blaze, Inc
+  which was subsequently licensed to Nefelus, Inc that has graciously
+  contributed it to OpenSTA.
 
 ## License
 
-This project is distributed under the **GNU General Public License v3 (GPLv3)**, consistent with the OpenSTA base project. See [LICENSE](LICENSE) for details.
+OpenSTA, Static Timing Analyzer
+Copyright (c) 2023, Parallax Software, Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.

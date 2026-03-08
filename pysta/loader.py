@@ -1,5 +1,5 @@
 """
-PySTA HyperLoader
+PySTA Design Loader
 
 The core loader that ingests OpenSTA CSV exports into a validated,
 indexed, zero-copy in-memory representation with topology analysis.
@@ -7,11 +7,14 @@ indexed, zero-copy in-memory representation with topology analysis.
 
 import os
 import time
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 import pandas as pd
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from .utils import (
     SCHEMA,
@@ -418,9 +421,9 @@ class Design:
         return col in self._nodes_df.columns
     
     def _log(self, *args):
-        """Print if verbose mode is on."""
+        """Emit log message at INFO level if verbose mode is enabled."""
         if self._verbose:
-            print(*args)
+            logger.info(" ".join(str(a) for a in args))
     
     # =========================================================================
     # PROPERTIES

@@ -73,7 +73,7 @@ def benchmark_loading(pysta_path, runs=3):
     
     print(f"  Nodes: {num_nodes:,}")
     print(f"  Arcs: {num_arcs:,}")
-    print(f"  PySTA Load Time: {format_time(avg_time)} (±{format_time(std_time)})")
+    print(f"  PySTA Load Time: {format_time(avg_time)} (+/-{format_time(std_time)})")
     
     # Estimated traditional TCL time (based on CircuitNet benchmarks)
     # TCL loop overhead: ~0.5ms per node for basic property access
@@ -323,7 +323,7 @@ def main():
     # Summary
     print_summary(all_results)
     
-    print("✓ Benchmark complete!")
+    print("[INFO] Benchmark complete.")
 
 
 if __name__ == '__main__':
