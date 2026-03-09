@@ -565,51 +565,51 @@ void writeNetworkArcs(const Sta *sta, const std::string &filename,
     return it != pinMap.end() ? it->second : "";
   };
 
-  // Extract min/max delays for all 4 rise/fall transition combinations
-  auto getEdgeDelays = [&](Edge *edge) -> std::string {
-    if (!edge) return "N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A";
+  // Helpers for min/max delay extraction across rise/fall transition pairs.
+  auto trIdx = [](const RiseFall *from, const RiseFall *to) -> int {
+    if (!from || !to) return -1;
+    int fi = (from == RiseFall::rise()) ? 0 : 1;
+    int ti = (to == RiseFall::rise()) ? 0 : 1;
+    return fi * 2 + ti; // 0:RR 1:RF 2:FR 3:FF
+  };
 
+  auto getAllEdgeDelays = [&](const std::vector<Edge*> &edges) -> std::string {
     float mn[4] = {1e30f, 1e30f, 1e30f, 1e30f};
     float mx[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
     bool fmn[4] = {}, fmx[4] = {};
     Sta *sm = const_cast<Sta*>(sta);
-    TimingArcSet *as = edge->timingArcSet();
 
-    auto trIdx = [](const RiseFall *from, const RiseFall *to) -> int {
-      if (!from || !to) return -1;
-      int fi = (from == RiseFall::rise()) ? 0 : 1;
-      int ti = (to == RiseFall::rise()) ? 0 : 1;
-      return fi * 2 + ti; // 0:RR 1:RF 2:FR 3:FF
-    };
-
-    for (const Corner *corner : *sta->corners()) {
-      for (const MinMax *mm : {MinMax::min(), MinMax::max()}) {
-        DcalcAnalysisPt *ap = corner->findDcalcAnalysisPt(mm);
-        if (!ap) continue;
-
-        if (as && !as->arcs().empty()) {
-          for (TimingArc *arc : as->arcs()) {
-            float d = sm->arcDelay(edge, arc, ap);
-            if (std::isnan(d)) continue;
-            int ti = (arc->fromEdge() && arc->toEdge())
-                     ? trIdx(arc->fromEdge()->asRiseFall(),
-                             arc->toEdge()->asRiseFall())
-                     : -1;
-            if (ti < 0) continue;
-            if (mm == MinMax::min()) {
-              if (!fmn[ti] || d < mn[ti]) { mn[ti] = d; fmn[ti] = true; }
-            } else {
-              if (!fmx[ti] || d > mx[ti]) { mx[ti] = d; fmx[ti] = true; }
+    for (Edge *edge : edges) {
+      if (!edge) continue;
+      TimingArcSet *as = edge->timingArcSet();
+      for (const Corner *corner : *sta->corners()) {
+        for (const MinMax *mm : {MinMax::min(), MinMax::max()}) {
+          DcalcAnalysisPt *ap = corner->findDcalcAnalysisPt(mm);
+          if (!ap) continue;
+          if (as && !as->arcs().empty()) {
+            for (TimingArc *arc : as->arcs()) {
+              float d = sm->arcDelay(edge, arc, ap);
+              if (std::isnan(d)) continue;
+              int ti = (arc->fromEdge() && arc->toEdge())
+                       ? trIdx(arc->fromEdge()->asRiseFall(),
+                               arc->toEdge()->asRiseFall())
+                       : -1;
+              if (ti < 0) continue;
+              if (mm == MinMax::min()) {
+                if (!fmn[ti] || d < mn[ti]) { mn[ti] = d; fmn[ti] = true; }
+              } else {
+                if (!fmx[ti] || d > mx[ti]) { mx[ti] = d; fmx[ti] = true; }
+              }
             }
-          }
-        } else {
-          float d = sm->arcDelay(edge, nullptr, ap);
-          if (std::isnan(d)) continue;
-          for (int i = 0; i < 4; i++) {
-            if (mm == MinMax::min()) {
-              if (!fmn[i] || d < mn[i]) { mn[i] = d; fmn[i] = true; }
-            } else {
-              if (!fmx[i] || d > mx[i]) { mx[i] = d; fmx[i] = true; }
+          } else {
+            float d = sm->arcDelay(edge, nullptr, ap);
+            if (std::isnan(d)) continue;
+            for (int i = 0; i < 4; i++) {
+              if (mm == MinMax::min()) {
+                if (!fmn[i] || d < mn[i]) { mn[i] = d; fmn[i] = true; }
+              } else {
+                if (!fmx[i] || d > mx[i]) { mx[i] = d; fmx[i] = true; }
+              }
             }
           }
         }
@@ -623,6 +623,12 @@ void writeNetworkArcs(const Sta *sta, const std::string &filename,
       r += (fmx[i] ? fmtDelayNs(mx[i]) : std::string("N/A"))
            + (i < 3 ? "," : "");
     return r;
+  };
+
+  // Single-edge wrapper.
+  auto getEdgeDelays = [&](Edge *edge) -> std::string {
+    if (!edge) return "N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A";
+    return getAllEdgeDelays({edge});
   };
 
   const int MAX_CONN = 1000000;
@@ -639,14 +645,154 @@ void writeNetworkArcs(const Sta *sta, const std::string &filename,
     connCount++;
   };
 
-  // Pass 1: Wire arcs from the timing graph
+  // Ensure the timing graph is built before any pass uses it.
   Graph *graph = sta->graph();
   if (!graph) {
     const_cast<Sta*>(sta)->ensureGraph();
     graph = sta->graph();
   }
-  if (graph) {
-    log << "Processing wire arcs...\n";
+
+  // Pass 1: Net arcs (driver-to-load connections).
+  log << "Processing net arcs...\n";
+  int netArcCount = 0;
+  NetIterator *ni = network->netIterator(top);
+  if (ni) {
+    while (Net *net = ni->next()) {
+      if (connCount >= MAX_CONN) break;
+      const char *nn = network->name(net);
+      std::string netName = nn ? nn : "UnnamedNet";
+
+      PinSet *drivers = network->drivers(net);
+      if (!drivers || drivers->empty()) continue;
+
+      for (const Pin *drv : *drivers) {
+        std::string sn = nodeName(drv);
+        if (sn.empty()) continue;
+        const PortDirection *dd = network->direction(const_cast<Pin*>(drv));
+        if (!useInternalNodes && dd && dd->name() &&
+            std::string(dd->name()) == "internal")
+          continue;
+
+        PinConnectedPinIterator *ci = network->connectedPinIterator(net);
+        if (!ci) continue;
+        int pinCnt = 0;
+        while (const Pin *ld = ci->next()) {
+          if (++pinCnt > 5000 || connCount >= MAX_CONN) break;
+          if (ld == drv) continue;
+          std::string tn = nodeName(ld);
+          if (tn.empty()) continue;
+          const PortDirection *ld_d = network->direction(const_cast<Pin*>(ld));
+          if (!useInternalNodes && ld_d && ld_d->name() &&
+              std::string(ld_d->name()) == "internal")
+            continue;
+
+          // Find graph edge for delay.
+          Edge *target = nullptr;
+          if (graph) {
+            Vertex *fv = graph->pinDrvrVertex(const_cast<Pin*>(drv));
+            if (!fv) fv = graph->pinLoadVertex(const_cast<Pin*>(drv));
+            Vertex *tv = graph->pinLoadVertex(const_cast<Pin*>(ld));
+            if (!tv) tv = graph->pinDrvrVertex(const_cast<Pin*>(ld));
+            if (fv && tv) {
+              VertexOutEdgeIterator ei(fv, graph);
+              while (ei.hasNext()) {
+                Edge *e = ei.next();
+                if (e->to(graph) == tv) { target = e; break; }
+              }
+            }
+          }
+          writeArc(sn, tn, netName, "net",
+                   target ? getEdgeDelays(target) : "N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A",
+                   "net_arc");
+          netArcCount++;
+        }
+        delete ci;
+      }
+    }
+    delete ni;
+  }
+  log << "Net arcs: " << netArcCount << "\n";
+
+  // Pass 2: Intra-cell timing arcs from liberty models.
+  log << "Processing cell timing arcs...\n";
+  int cellArcCount = 0;
+
+  std::function<void(Instance*)> processCellArcs = [&](Instance *inst) {
+    if (inst == top) return;
+    Cell *cell = network->cell(inst);
+    if (!cell) return;
+    LibertyCell *lc = sta->networkReader()->libertyCell(cell);
+    if (!lc) return;
+
+    // One output row per (from-pin, to-pin) pair per instance.
+    std::unordered_set<std::string> cellSeen;
+
+    for (TimingArcSet *as : lc->timingArcSets()) {
+      LibertyPort *fp = as->from(), *tp = as->to();
+      if (!fp || !tp) continue;
+
+      // Only combinational and clock-to-Q arcs.
+      bool valid = false;
+      for (TimingArc *arc : as->arcs()) {
+        const TimingRole *role = arc->role();
+        if (role == TimingRole::combinational() ||
+            role == TimingRole::regClkToQ()) {
+          valid = true;
+          break;
+        }
+      }
+      if (!valid) continue;
+
+      Pin *fpin = network->findPin(inst, fp->name());
+      Pin *tpin = network->findPin(inst, tp->name());
+      if (!fpin || !tpin) continue;
+
+      std::string sn = nodeName(fpin), tn = nodeName(tpin);
+      if (sn.empty() || tn.empty()) continue;
+
+      // Skip duplicate (from, to) pairs for this instance.
+      std::string pairKey = sn + "-" + tn;
+      if (!cellSeen.insert(pairKey).second) continue;
+
+      // Collect all graph edges between this pin pair.
+      std::vector<Edge*> targets;
+      if (graph) {
+        Vertex *fv = graph->pinDrvrVertex(fpin);
+        if (!fv) fv = graph->pinLoadVertex(fpin);
+        Vertex *tv = graph->pinLoadVertex(tpin);
+        if (!tv) tv = graph->pinDrvrVertex(tpin);
+        if (fv && tv) {
+          VertexOutEdgeIterator ei(fv, graph);
+          while (ei.hasNext()) {
+            Edge *e = ei.next();
+            if (e->to(graph) == tv) targets.push_back(e);
+          }
+        }
+      }
+      writeArc(sn, tn, "cell_internal", "internal",
+               targets.empty() ? "N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A"
+                               : getAllEdgeDelays(targets),
+               "timing_arc");
+      cellArcCount++;
+      if (connCount >= MAX_CONN) return;
+    }
+  };
+
+  std::function<void(Instance*)> walkInst = [&](Instance *inst) {
+    processCellArcs(inst);
+    InstanceChildIterator *ci = network->childIterator(inst);
+    if (ci) {
+      while (ci->hasNext()) walkInst(ci->next());
+      delete ci;
+    }
+  };
+  walkInst(top);
+  log << "Cell timing arcs: " << cellArcCount << "\n";
+
+  // Pass 3: Internal wire arcs from the timing graph (only with useInternalNodes).
+  if (useInternalNodes && graph) {
+    log << "Processing internal wire arcs...\n";
+    int wireArcCount = 0;
     VertexIterator vi(graph);
     while (vi.hasNext() && connCount < MAX_CONN) {
       Vertex *fv = vi.next();
@@ -666,138 +812,13 @@ void writeNetworkArcs(const Sta *sta, const std::string &filename,
           continue;
         writeArc(sn, tn, "internal_net", "internal",
                  getEdgeDelays(e), "internal_arc");
+        wireArcCount++;
       }
     }
+    log << "Internal wire arcs: " << wireArcCount << "\n";
   }
 
-  // Pass 2: Intra-cell timing arcs from liberty models
-  log << "Processing cell timing arcs...\n";
-  int cellArcCount = 0;
-
-  std::function<void(Instance*)> processCellArcs = [&](Instance *inst) {
-    if (inst == top) return;
-    Cell *cell = network->cell(inst);
-    if (!cell) return;
-    LibertyCell *lc = sta->networkReader()->libertyCell(cell);
-    if (!lc) return;
-
-    for (TimingArcSet *as : lc->timingArcSets()) {
-      LibertyPort *fp = as->from(), *tp = as->to();
-      if (!fp || !tp) continue;
-
-      // Only combinational and clock-to-Q arcs
-      bool valid = false;
-      for (TimingArc *arc : as->arcs()) {
-        const TimingRole *role = arc->role();
-        if (role == TimingRole::combinational() ||
-            role == TimingRole::regClkToQ()) {
-          valid = true;
-          break;
-        }
-      }
-      if (!valid) continue;
-
-      Pin *fpin = network->findPin(inst, fp->name());
-      Pin *tpin = network->findPin(inst, tp->name());
-      if (!fpin || !tpin) continue;
-
-      std::string sn = nodeName(fpin), tn = nodeName(tpin);
-      if (sn.empty() || tn.empty()) continue;
-
-      // Find matching edge in graph for delay extraction
-      Edge *target = nullptr;
-      if (graph) {
-        Vertex *fv = graph->pinDrvrVertex(fpin);
-        if (!fv) fv = graph->pinLoadVertex(fpin);
-        Vertex *tv = graph->pinLoadVertex(tpin);
-        if (!tv) tv = graph->pinDrvrVertex(tpin);
-        if (fv && tv) {
-          VertexOutEdgeIterator ei(fv, graph);
-          while (ei.hasNext()) {
-            Edge *e = ei.next();
-            if (e->to(graph) == tv) { target = e; break; }
-          }
-        }
-      }
-      writeArc(sn, tn, "cell_internal", "internal",
-               target ? getEdgeDelays(target) : "N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A",
-               "timing_arc");
-      cellArcCount++;
-      if (connCount >= MAX_CONN) return;
-    }
-  };
-
-  std::function<void(Instance*)> walkInst = [&](Instance *inst) {
-    processCellArcs(inst);
-    InstanceChildIterator *ci = network->childIterator(inst);
-    if (ci) {
-      while (ci->hasNext()) walkInst(ci->next());
-      delete ci;
-    }
-  };
-  walkInst(top);
-  log << "Cell timing arcs: " << cellArcCount << "\n";
-
-  // Pass 3: Net arcs (driver to load connections)
-  log << "Processing net arcs...\n";
-  int netArcCount = 0;
-  NetIterator *ni = network->netIterator(top);
-  if (!ni) return;
-
-  while (Net *net = ni->next()) {
-    if (connCount >= MAX_CONN) break;
-    const char *nn = network->name(net);
-    std::string netName = nn ? nn : "UnnamedNet";
-
-    PinSet *drivers = network->drivers(net);
-    if (!drivers || drivers->empty()) continue;
-
-    for (const Pin *drv : *drivers) {
-      std::string sn = nodeName(drv);
-      if (sn.empty()) continue;
-      const PortDirection *dd = network->direction(const_cast<Pin*>(drv));
-      if (!useInternalNodes && dd && dd->name() &&
-          std::string(dd->name()) == "internal")
-        continue;
-
-      PinConnectedPinIterator *ci = network->connectedPinIterator(net);
-      if (!ci) continue;
-      int pinCnt = 0;
-      while (const Pin *ld = ci->next()) {
-        if (++pinCnt > 5000 || connCount >= MAX_CONN) break;
-        if (ld == drv) continue;
-        std::string tn = nodeName(ld);
-        if (tn.empty()) continue;
-        const PortDirection *ld_d = network->direction(const_cast<Pin*>(ld));
-        if (!useInternalNodes && ld_d && ld_d->name() &&
-            std::string(ld_d->name()) == "internal")
-          continue;
-
-        // Find graph edge for delay
-        Edge *target = nullptr;
-        if (graph) {
-          Vertex *fv = graph->pinDrvrVertex(const_cast<Pin*>(drv));
-          if (!fv) fv = graph->pinLoadVertex(const_cast<Pin*>(drv));
-          Vertex *tv = graph->pinLoadVertex(const_cast<Pin*>(ld));
-          if (!tv) tv = graph->pinDrvrVertex(const_cast<Pin*>(ld));
-          if (fv && tv) {
-            VertexOutEdgeIterator ei(fv, graph);
-            while (ei.hasNext()) {
-              Edge *e = ei.next();
-              if (e->to(graph) == tv) { target = e; break; }
-            }
-          }
-        }
-        writeArc(sn, tn, netName, "net",
-                 target ? getEdgeDelays(target) : "N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A",
-                 "net_arc");
-        netArcCount++;
-      }
-      delete ci;
-    }
-  }
-  delete ni;
-  log << "Net arcs: " << netArcCount << ", total: " << connCount << "\n";
+  log << "Total arcs written: " << connCount << "\n";
 }
 
 
