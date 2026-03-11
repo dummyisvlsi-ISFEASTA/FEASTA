@@ -772,7 +772,7 @@ void writeNetworkArcs(const Sta *sta, const std::string &filename,
       writeArc(sn, tn, "cell_internal", "internal",
                targets.empty() ? "N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A"
                                : getAllEdgeDelays(targets),
-               "cell_arc");
+               "timing_arc");
       cellArcCount++;
       if (connCount >= MAX_CONN) return;
     }
