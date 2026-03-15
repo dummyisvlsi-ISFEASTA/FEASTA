@@ -53,7 +53,7 @@ def _build_query_nodes(design):
 
     merge_cols = [
         col
-        for col in ["FullName", "SlackWorst_ns", "IsClock", "ClockNames", "Capacitance_pf"]
+        for col in ["FullName", "SlackWorst_ns", "IsClock", "ClockNames", "Capacitance_pf", "IsHierarchical"]
         if col in pin_df.columns
     ]
     if len(merge_cols) <= 1:
@@ -98,7 +98,7 @@ def _annotated_pin_df(design, nodes_df):
 
     cols = [
         col
-        for col in ["FullName", "SlackWorst_ns", "IsClock", "ClockNames", "Capacitance_pf", "Direction"]
+        for col in ["FullName", "SlackWorst_ns", "IsClock", "ClockNames", "Capacitance_pf", "Direction", "IsHierarchical"]
         if col in pin_df.columns
     ]
     pins = pin_df[cols].copy()
@@ -171,23 +171,18 @@ def _pick_register_q(design, nodes_df):
     return str(q_df.iloc[0]["Name"])
 
 
-def _worst_violations(seed_df, top_k):
-    if seed_df is None or seed_df.empty or "SlackWorst_ns" not in seed_df.columns:
-        return {"violation_count": 0, "top_k": []}
-
-    slack = pd.to_numeric(seed_df["SlackWorst_ns"], errors="coerce")
-    viol = seed_df[slack < 0].copy()
-    if viol.empty:
+def _hierarchical_pins(design):
+    pins = design.pins.filter(IsHierarchical=True)
+    if pins.empty:
         return {
-            "violation_count": 0,
-            "top_k": [],
+            "pin_count": 0,
+            "sample": [],
         }
 
-    cols = [c for c in ["Name", "SlackWorst_ns", "Direction"] if c in viol.columns]
-    worst = viol[cols].sort_values("SlackWorst_ns").head(top_k)
+    cols = [c for c in ["Name", "Direction", "IsHierarchical", "SlackWorst_ns"] if c in pins.columns]
     return {
-        "violation_count": int(len(viol)),
-        "top_k": worst.to_dict(orient="records"),
+        "pin_count": int(len(pins)),
+        "sample": pins[cols].head(10).to_dict(orient="records"),
     }
 
 
@@ -228,35 +223,30 @@ def _critical_paths(design, seed_df, top_k, max_stages=100):
     return compact
 
 
-def _path_pair_from_slack(design, seed_df, max_stages=100):
-    paths = _critical_paths(design, seed_df, top_k=1, max_stages=max_stages)
-    if not paths:
-        raise ValueError("Could not derive a startpoint-endpoint path pair")
+def _sequential_cells_with_many_pins(design, min_pins=4):
+    cells = design.cells
+    if cells is None or cells.empty:
+        return {"cell_count": 0, "sample": []}
 
-    path = paths[0]
-    return path["startpoint"], path["endpoint"], path["slack_ns"]
+    df = cells.copy()
+    if "IsSequential" not in df.columns or "PinCount" not in df.columns:
+        return {"cell_count": 0, "sample": []}
 
+    seq_mask = df["IsSequential"].map(
+        {True: True, False: False, "true": True, "false": False, "True": True, "False": False}
+    ).fillna(False)
+    pin_count = pd.to_numeric(df["PinCount"], errors="coerce").fillna(0)
+    matches = df[seq_mask & (pin_count > min_pins)].copy()
 
-def _paths_between(design, startpoint, endpoint, top_k, max_stages=100):
-    paths = design.pins.get_paths_between(
-        startpoint,
-        endpoint,
-        top_k=top_k,
-        max_stages=max_stages,
-    )
-    compact = []
-    for path in paths:
-        path_nodes = path["path"]
-        compact.append(
-            {
-                "startpoint": path["startpoint"],
-                "endpoint": path["endpoint"],
-                "stages": path["stages"],
-                "path_head": path_nodes[:3],
-                "path_tail": path_nodes[-3:],
-            }
-        )
-    return compact
+    cols = [
+        c for c in
+        ["FullInstanceName", "LibertyCell", "PinCount", "ClockDomains", "CellType"]
+        if c in matches.columns
+    ]
+    return {
+        "cell_count": int(len(matches)),
+        "sample": matches[cols].head(10).to_dict(orient="records") if not matches.empty else [],
+    }
 
 
 def _fanout_cone(design, node_name, depth):
@@ -327,13 +317,11 @@ def main():
 
     worst_name, worst_slack = _pick_worst_endpoint(design, query_nodes)
     q_name = _pick_register_q(design, query_nodes)
-    pair_start, pair_end, pair_slack = _path_pair_from_slack(design, timing_seed_df)
-
     tasks = [
         (
-            "worst_violations",
-            f"design.filter(SlackWorst_ns__lt=0) -> sort by SlackWorst_ns -> head({args.top_k})",
-            lambda: _worst_violations(annotated_pins, args.top_k),
+            "hierarchical_pins",
+            "design.pins.filter(IsHierarchical=True)",
+            lambda: _hierarchical_pins(design),
         ),
         (
             "critical_paths",
@@ -341,9 +329,9 @@ def main():
             lambda: _critical_paths(design, timing_seed_df, args.top_k),
         ),
         (
-            "paths_between_pair",
-            f"design.get_paths_between('{pair_start}', '{pair_end}', top_k={args.top_k})",
-            lambda: _paths_between(design, pair_start, pair_end, args.top_k),
+            "sequential_cells_gt4_pins",
+            "design.cells[(IsSequential == True) & (PinCount > 4)]",
+            lambda: _sequential_cells_with_many_pins(design, min_pins=4),
         ),
         (
             "fanout_register_q",
@@ -364,7 +352,6 @@ def main():
     print(f"PySTA Load CSV          : {load_time:.2f}s")
     print(f"Topology Build          : {topo_time:.2f}s")
     print(f"Worst endpoint seed     : {worst_name} ({worst_slack:.6f} ns)")
-    print(f"Path pair seed          : {pair_start} -> {pair_end} ({pair_slack:.6f} ns)")
     print(f"Register/Q seed         : {q_name}")
     print("=" * 72)
 
