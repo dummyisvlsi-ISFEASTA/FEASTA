@@ -1,4 +1,4 @@
-# Parallax Static Timing Analyzer
+# FEASTA : an extension to OpenSTA
 
 OpenSTA is a gate level static timing verifier. As a stand-alone
 executable it can be used to verify the timing of a design using
@@ -12,8 +12,18 @@ standard file formats.
 * VCD power acitivies
 * SAIF power acitivies
 
-OpenSTA uses a TCL command interpreter to read the design, specify
+OpenSTA uses a TCL command interpreter to read the dlesign, specify
 timing constraints and print timing reports.
+
+### FEASTA additions
+
+FEASTA extends the OpenSTA codebase with native data export and query
+support aimed at timing-analysis-driven machine learning workflows.
+The extension adds:
+
+* CSV generation for nodes, arcs, pins, and cells directly from the STA engine
+* PySTA utilities for loading exported design data into tabular and graph pipelines
+* Query-oriented access to design, timing, and topology information for downstream analysis
 
 ##### Clocks
 * Generated
@@ -256,33 +266,6 @@ case directory.
 The files in the test case should be collected into a directory.
 The contents of the directory should be collected into a compressed
 tarfile.
-
-## Contributions
-
-Contributors must sign the Contributor License Agreement (doc/CLA.txt)
-when submitting pull requests.
-
-All contributors should read doc/CodingGuidelines.txt for notes on
-making code that adheres to the existing naming and formatting style.
-
-Contributions that claim 4% performance improvements in OpenROAD flow
-scripts will largely be ignored. Small performance improvements
-simply do not justify the time required to audit and verify the changes.
-
-Contributions that add dependencies on external libraries like boost,
-abseil and Intel TBB will not be accepted.
-
-As the author of OpenSTA I vastly prefer writing code to reviewing
-code.  I don't have the patience to go round after round to correct
-code formatting that is not consistent with the rest of the code.
-
-## Authors
-
-* James Cherry
-
-* William Scott authored the arnoldi delay calculator at Blaze, Inc
-  which was subsequently licensed to Nefelus, Inc that has graciously
-  contributed it to OpenSTA.
 
 ## License
 
