@@ -8,6 +8,7 @@
 #include "sta/TimingArc.hh"
 #include "sta/TimingModel.hh"
 #include "sta/Graph.hh"
+#include "sta/GraphDelayCalc.hh"
 #include "sta/Sta.hh"
 #include "sta/Corner.hh"
 #include "sta/Path.hh"
@@ -41,7 +42,50 @@ namespace sta {
 
 namespace {
 
-// ---- Formatting utilities ----
+// CSV formatting helpers.
+
+constexpr const char *kVerilogCsvLog = "csv_writer_verilog.log";
+constexpr const char *kNodesCsvLog = "csv_writer_nodes.log";
+constexpr const char *kArcsCsvLog = "csv_writer_arcs.log";
+constexpr const char *kPinPropsCsvLog = "csv_writer_pin_properties.log";
+
+constexpr int kClockTraceLimit = 500000;
+constexpr int kMaxConnections = 1000000;
+constexpr int kMaxPinsPerNet = 5000;
+
+template <typename Func>
+void runSafely(Func &&func,
+               std::ofstream *log = nullptr,
+               const char *context = nullptr)
+{
+  try {
+    func();
+  } catch (const std::exception &e) {
+    if (log && context)
+      *log << context << ": " << e.what() << "\n";
+  } catch (...) {
+    if (log && context)
+      *log << context << "\n";
+  }
+}
+
+template <typename T, typename Func>
+T evalOr(Func &&func,
+         const T &fallback,
+         std::ofstream *log = nullptr,
+         const char *context = nullptr)
+{
+  try {
+    return func();
+  } catch (const std::exception &e) {
+    if (log && context)
+      *log << context << ": " << e.what() << "\n";
+  } catch (...) {
+    if (log && context)
+      *log << context << "\n";
+  }
+  return fallback;
+}
 
 std::string csvEscape(const std::string &field) {
   if (field.find(',') == std::string::npos &&
@@ -87,6 +131,16 @@ std::string fmtTimingNs3(float val) {
 std::string fmtDelayNs(float val) {
   if (std::isnan(val) || std::isinf(val) || val == INF || val == -INF)
     return "";
+  float ns = val * 1e9f;
+  if (std::abs(ns) < 1e-6f) return "0.000";
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(3) << ns;
+  return oss.str();
+}
+
+std::string fmtFeatureNs(float val) {
+  if (std::isnan(val) || std::isinf(val) || val == INF || val == -INF)
+    return "N/A";
   float ns = val * 1e9f;
   if (std::abs(ns) < 1e-6f) return "0.000";
   std::ostringstream oss;
@@ -154,7 +208,71 @@ std::string joinSet(const std::set<std::string> &s, int limit = 15) {
   return r;
 }
 
-// ---- Hierarchy traversal helpers (used by writeVerilogCsv) ----
+std::string pinNodeName(const std::string &inst_name,
+                        const std::string &pin_name)
+{
+  return (inst_name == "top" || inst_name.empty())
+      ? pin_name
+      : inst_name + ":" + pin_name;
+}
+
+bool skipInternalPin(const PortDirection *dir, bool use_internal_nodes)
+{
+  return !use_internal_nodes
+      && dir
+      && dir->name()
+      && std::string(dir->name()) == "internal";
+}
+
+void buildPinNodeMap(const Network *network,
+                     Instance *top,
+                     bool use_internal_nodes,
+                     std::unordered_map<uintptr_t, std::string> &pin_map)
+{
+  if (!network || !top)
+    return;
+
+  auto register_pin = [&](Pin *pin, const std::string &inst_name) {
+    const PortDirection *dir = network->direction(pin);
+    if (skipInternalPin(dir, use_internal_nodes))
+      return;
+    pin_map[reinterpret_cast<uintptr_t>(pin)] =
+        pinNodeName(inst_name, safeStr(network->name(pin)));
+  };
+
+  InstancePinIterator *top_pins = network->pinIterator(top);
+  if (top_pins) {
+    while (Pin *pin = top_pins->next())
+      register_pin(pin, "top");
+    delete top_pins;
+  }
+
+  std::function<void(Instance*, const std::string&)> walk_hierarchy;
+  walk_hierarchy = [&](Instance *inst, const std::string &hier) {
+    std::string full_name;
+    if (inst != top) {
+      std::string inst_name = safeStr(network->name(inst));
+      full_name = hier.empty() ? inst_name : hier + "/" + inst_name;
+      InstancePinIterator *pins = network->pinIterator(inst);
+      if (pins) {
+        while (Pin *pin = pins->next())
+          register_pin(pin, full_name);
+        delete pins;
+      }
+    }
+
+    InstanceChildIterator *children = network->childIterator(inst);
+    if (!children)
+      return;
+    while (children->hasNext())
+      walk_hierarchy(children->next(), full_name);
+    delete children;
+  };
+
+  walk_hierarchy(top, "");
+}
+
+// Hierarchy traversal helpers for the structural Verilog CSV export.
 
 void writeInstPins(const Network *network, std::ofstream &csv,
                    std::ofstream &log, Instance *inst,
@@ -194,12 +312,12 @@ void traverseForCsv(const Network *network, std::ofstream &csv,
   delete ci;
 }
 
-// ---- Clock domain mapping via graph BFS ----
+// Build a per-pin clock-domain view by walking the timing graph from clock sources.
 
 void buildClockDomainMap(const Sta *sta,
                          std::map<Pin*, std::set<std::string>> &domains,
                          std::map<Pin*, bool> &is_clk_src,
-                         std::ofstream &/*log*/) {
+                         std::ofstream &log) {
   Sta *sm = const_cast<Sta*>(sta);
   Network *net = sta->network();
   Graph *graph = sta->graph();
@@ -221,100 +339,114 @@ void buildClockDomainMap(const Sta *sta,
     }
 
     if (!graph) continue;
-    try {
-      SearchPred *pred = sm->search()->searchAdj();
-      if (!pred) continue;
+    SearchPred *pred = evalOr<SearchPred*>(
+        [&] { return sm->search()->searchAdj(); },
+        nullptr,
+        &log,
+        "Clock-domain traversal setup failed");
+    if (!pred)
+      continue;
 
-      std::set<Vertex*> visited;
-      std::queue<Vertex*> q;
-      for (const Pin *cp : clk->pins()) {
-        if (!cp) continue;
-        Vertex *v = graph->pinDrvrVertex(cp);
-        if (!v) v = graph->pinLoadVertex(cp);
-        if (v && visited.insert(v).second) q.push(v);
+    std::set<Vertex*> visited;
+    std::queue<Vertex*> q;
+    for (const Pin *cp : clk->pins()) {
+      if (!cp) continue;
+      Vertex *v = graph->pinDrvrVertex(cp);
+      if (!v) v = graph->pinLoadVertex(cp);
+      if (v && visited.insert(v).second) q.push(v);
+    }
+
+    int traced = 0;
+    // Guard the BFS to keep pathological clock graphs from exploding runtime.
+    while (!q.empty() && traced < kClockTraceLimit) {
+      Vertex *v = q.front(); q.pop();
+      traced++;
+      if (!v) continue;
+
+      Pin *vp = v->pin();
+      if (vp) {
+        domains[vp].insert(cn);
+        runSafely(
+            [&] {
+              LibertyPort *lp = net->libertyPort(vp);
+              if (lp && lp->isRegClk())
+                domains[vp].insert(cn);
+            },
+            &log,
+            "Clock-domain register-clock tagging failed");
       }
 
-      int traced = 0;
-      while (!q.empty() && traced < 500000) {
-        Vertex *v = q.front(); q.pop();
-        traced++;
-        if (!v) continue;
-
-        Pin *vp = v->pin();
-        if (vp) {
-          domains[vp].insert(cn);
-          try {
-            LibertyPort *lp = net->libertyPort(vp);
-            if (lp && lp->isRegClk()) domains[vp].insert(cn);
-          } catch (...) {}
-        }
-
-        try {
-          VertexOutEdgeIterator ei(v, graph);
-          while (ei.hasNext()) {
-            Edge *e = ei.next();
-            if (e && pred->searchThru(e)) {
-              Vertex *to = e->to(graph);
-              if (to && visited.insert(to).second) q.push(to);
+      runSafely(
+          [&] {
+            VertexOutEdgeIterator ei(v, graph);
+            while (ei.hasNext()) {
+              Edge *e = ei.next();
+              if (e && pred->searchThru(e)) {
+                Vertex *to = e->to(graph);
+                if (to && visited.insert(to).second)
+                  q.push(to);
+              }
             }
-          }
-        } catch (...) {}
-      }
-    } catch (...) {}
+          },
+          &log,
+          "Clock-domain edge traversal failed");
+    }
   }
 
   // Propagate clock domain to register clock pins via incoming edges
-  try {
-    LeafInstanceIterator *li = net->leafInstanceIterator();
-    if (!li) return;
-    while (li->hasNext()) {
-      Instance *inst = li->next();
-      if (!inst) continue;
-      InstancePinIterator *pi = net->pinIterator(inst);
-      if (!pi) continue;
-      while (Pin *pin = pi->next()) {
-        if (!pin) continue;
-        try {
-          LibertyPort *lp = net->libertyPort(pin);
-          if (!lp || !lp->isRegClk() || !domains[pin].empty()) continue;
-          if (graph) {
-            Vertex *lv = graph->pinLoadVertex(pin);
-            if (lv) {
-              VertexInEdgeIterator iei(lv, graph);
-              while (iei.hasNext()) {
-                Edge *e = iei.next();
-                if (!e) continue;
-                Vertex *fv = e->from(graph);
-                if (!fv) continue;
-                Pin *fp = fv->pin();
-                if (fp && !domains[fp].empty()) {
-                  for (const auto &c : domains[fp]) domains[pin].insert(c);
-                  break;
+  LeafInstanceIterator *li = net->leafInstanceIterator();
+  if (!li)
+    return;
+  while (li->hasNext()) {
+    Instance *inst = li->next();
+    if (!inst) continue;
+    InstancePinIterator *pi = net->pinIterator(inst);
+    if (!pi) continue;
+    while (Pin *pin = pi->next()) {
+      if (!pin) continue;
+      runSafely(
+          [&] {
+            LibertyPort *lp = net->libertyPort(pin);
+            if (!lp || !lp->isRegClk() || !domains[pin].empty())
+              return;
+            if (graph) {
+              Vertex *lv = graph->pinLoadVertex(pin);
+              if (lv) {
+                VertexInEdgeIterator iei(lv, graph);
+                while (iei.hasNext()) {
+                  Edge *e = iei.next();
+                  if (!e) continue;
+                  Vertex *fv = e->from(graph);
+                  if (!fv) continue;
+                  Pin *fp = fv->pin();
+                  if (fp && !domains[fp].empty()) {
+                    for (const auto &c : domains[fp])
+                      domains[pin].insert(c);
+                    break;
+                  }
                 }
               }
             }
-          }
-          // Default to sole clock if only one exists
-          if (domains[pin].empty() && clocks->size() == 1) {
-            Clock *dc = (*clocks)[0];
-            if (dc && dc->name()) domains[pin].insert(dc->name());
-          }
-        } catch (...) {}
-      }
-      delete pi;
+            if (domains[pin].empty() && clocks->size() == 1) {
+              Clock *dc = (*clocks)[0];
+              if (dc && dc->name())
+                domains[pin].insert(dc->name());
+            }
+          },
+          &log,
+          "Clock-domain back-propagation failed");
     }
-    delete li;
-  } catch (...) {}
+    delete pi;
+  }
+  delete li;
 }
 
 } // anonymous namespace
 
 
-// ---- writeVerilogCsv ----
-
 void writeVerilogCsv(const Network *network, const std::string &filename) {
   std::ofstream csv(filename);
-  std::ofstream log("log.txt", std::ios::app);
+  std::ofstream log(kVerilogCsvLog, std::ios::app);
   if (!csv.is_open()) { log << "Cannot open " << filename << "\n"; return; }
 
   csv << "Module,Instance,CellType,PinName,Direction,Net\n";
@@ -324,12 +456,10 @@ void writeVerilogCsv(const Network *network, const std::string &filename) {
 }
 
 
-// ---- writeNetworkNodes ----
-
 void writeNetworkNodes(const Sta *sta, const std::string &filename,
                        bool useInternalNodes) {
   std::ofstream csv(filename);
-  std::ofstream log("/tmp/nodes_log.txt", std::ios::app);
+  std::ofstream log(kNodesCsvLog, std::ios::app);
   if (!csv.is_open()) { log << "Cannot open " << filename << "\n"; return; }
 
   csv << "Name,InstanceName,PinName,Direction,IsPort,Type,"
@@ -340,96 +470,97 @@ void writeNetworkNodes(const Sta *sta, const std::string &filename,
   if (!top) { log << "Top instance is null\n"; return; }
 
   // Initialize timing engine
-  try {
-    Sta *sm = const_cast<Sta*>(sta);
-    sm->ensureGraph();
-    sm->ensureLevelized();
-    sm->searchPreamble();
-    sm->search()->findAllArrivals();
-    sm->ensureClkNetwork();
-  } catch (...) {
-    log << "Warning: could not initialize clock network\n";
-  }
+  Sta *sm = const_cast<Sta*>(sta);
+  runSafely(
+      [&] {
+        sm->ensureGraph();
+        sm->ensureLevelized();
+        sm->searchPreamble();
+        sm->search()->findAllArrivals();
+        sm->ensureClkNetwork();
+      },
+      &log,
+      "Warning: could not initialize clock network");
 
   // BFS to find clock network pins using hierarchical string names
   std::unordered_set<std::string> clockNodes;
-  try {
-    const Sdc *sdc = sta->sdc();
-    if (sdc) {
-      std::queue<std::pair<const Pin*, std::string>> bfs;
-      for (Clock *clk : const_cast<Sdc*>(sdc)->clks()) {
-        for (const Pin *src : clk->pins()) {
-          Instance *pi = network->instance(src);
-          std::string ip;
-          if (pi && pi != top) {
-            const char *pc = network->pathName(pi);
-            if (pc) ip = pc;
+  runSafely(
+      [&] {
+        const Sdc *sdc = sta->sdc();
+        if (!sdc)
+          return;
+        std::queue<std::pair<const Pin*, std::string>> bfs;
+        for (Clock *clk : const_cast<Sdc*>(sdc)->clks()) {
+          for (const Pin *src : clk->pins()) {
+            Instance *pi = network->instance(src);
+            std::string ip;
+            if (pi && pi != top) {
+              const char *pc = network->pathName(pi);
+              if (pc) ip = pc;
+            }
+            std::string pn = safeStr(network->name(src));
+            std::string nn = ip.empty() ? pn : ip + ":" + pn;
+            if (clockNodes.insert(nn).second)
+              bfs.push({src, ip});
           }
-          std::string pn = safeStr(network->name(src));
-          std::string nn = ip.empty() ? pn : ip + ":" + pn;
-          if (clockNodes.insert(nn).second)
-            bfs.push({src, ip});
         }
-      }
 
-      int limit = 500000;
-      while (!bfs.empty() && limit-- > 0) {
-        auto [pin, instPath] = bfs.front(); bfs.pop();
+        int limit = kClockTraceLimit;
+        while (!bfs.empty() && limit-- > 0) {
+          auto [pin, instPath] = bfs.front(); bfs.pop();
 
-        PinConnectedPinIterator *ci = network->connectedPinIterator(pin);
-        if (!ci) continue;
-        while (ci->hasNext()) {
-          const Pin *cp = ci->next();
-          Instance *cInst = network->instance(cp);
-          std::string cip;
-          if (cInst && cInst != top) {
-            const char *pc = network->pathName(cInst);
-            if (pc) cip = pc;
-          }
-          std::string cpn = safeStr(network->name(cp));
-          std::string cnn = cip.empty() ? cpn : cip + ":" + cpn;
-          if (!clockNodes.insert(cnn).second) continue;
+          PinConnectedPinIterator *ci = network->connectedPinIterator(pin);
+          if (!ci) continue;
+          while (ci->hasNext()) {
+            const Pin *cp = ci->next();
+            Instance *cInst = network->instance(cp);
+            std::string cip;
+            if (cInst && cInst != top) {
+              const char *pc = network->pathName(cInst);
+              if (pc) cip = pc;
+            }
+            std::string cpn = safeStr(network->name(cp));
+            std::string cnn = cip.empty() ? cpn : cip + ":" + cpn;
+            if (!clockNodes.insert(cnn).second) continue;
 
-          const PortDirection *cd = network->direction(cp);
-          if (cd && cd->isInput()) {
-            LibertyPort *lp = network->libertyPort(cp);
-            bool isClkIn = lp && (lp->isRegClk() || lp->isClockGateClock()
-                                  || lp->isClock());
-            if (isClkIn && cInst) {
-              // Follow clock through buffers, inverters, ICGs
-              InstancePinIterator *ipi = network->pinIterator(cInst);
-              if (ipi) {
-                while (ipi->hasNext()) {
-                  Pin *op = ipi->next();
-                  const PortDirection *od = network->direction(op);
-                  if (!od || !od->isOutput()) continue;
-                  LibertyPort *olp = network->libertyPort(op);
-                  bool isClkOut = olp && olp->isClockGateOut();
-                  if (!isClkOut && lp) {
-                    LibertyCell *lc = lp->libertyCell();
-                    if (lc) isClkOut = lc->isBuffer() || lc->isInverter();
+            const PortDirection *cd = network->direction(cp);
+            if (cd && cd->isInput()) {
+              LibertyPort *lp = network->libertyPort(cp);
+              bool isClkIn = lp && (lp->isRegClk() || lp->isClockGateClock()
+                                    || lp->isClock());
+              if (isClkIn && cInst) {
+                InstancePinIterator *ipi = network->pinIterator(cInst);
+                if (ipi) {
+                  while (ipi->hasNext()) {
+                    Pin *op = ipi->next();
+                    const PortDirection *od = network->direction(op);
+                    if (!od || !od->isOutput()) continue;
+                    LibertyPort *olp = network->libertyPort(op);
+                    bool isClkOut = olp && olp->isClockGateOut();
+                    if (!isClkOut && lp) {
+                      LibertyCell *lc = lp->libertyCell();
+                      if (lc) isClkOut = lc->isBuffer() || lc->isInverter();
+                    }
+                    if (isClkOut) {
+                      std::string opn = safeStr(network->name(op));
+                      std::string onn = cip.empty() ? opn : cip + ":" + opn;
+                      if (clockNodes.insert(onn).second)
+                        bfs.push({op, cip});
+                    }
                   }
-                  if (isClkOut) {
-                    std::string opn = safeStr(network->name(op));
-                    std::string onn = cip.empty() ? opn : cip + ":" + opn;
-                    if (clockNodes.insert(onn).second)
-                      bfs.push({op, cip});
-                  }
+                  delete ipi;
                 }
-                delete ipi;
               }
             }
+            if (cInst && network->isHierarchical(cInst))
+              bfs.push({cp, cip});
           }
-          if (cInst && network->isHierarchical(cInst))
-            bfs.push({cp, cip});
+          delete ci;
         }
-        delete ci;
-      }
-    }
-    log << "Clock network pins found: " << clockNodes.size() << "\n";
-  } catch (...) {
-    log << "Warning: could not build clock network set\n";
-  }
+        log << "Clock network pins found: " << clockNodes.size() << "\n";
+      },
+      &log,
+      "Warning: could not build clock network set");
 
   // Pin-to-node-name map (also written to file for arc creation)
   std::unordered_map<Pin*, std::string> pinNodeMap;
@@ -452,9 +583,8 @@ void writeNetworkNodes(const Sta *sta, const std::string &filename,
       }
     }
 
-    std::string node = (instName == "top" || instName.empty())
-                       ? pn : instName + ":" + pn;
-    bool isClock = clockNodes.count(node) || sta->isClock(pin);
+	    std::string node = pinNodeName(instName, pn);
+	    bool isClock = clockNodes.count(node) || sta->isClock(pin);
     pinNodeMap[pin] = node;
 
     csv << csvEscape(node) << "," << csvEscape(instName) << ","
@@ -491,8 +621,8 @@ void writeNetworkNodes(const Sta *sta, const std::string &filename,
   };
   traverse(top, "");
 
-  // Persist pin-to-node mapping for external tools
-  std::ofstream mapFile("pin_node_map.dat");
+	  // Persist pin-to-node mapping for external tools
+	  std::ofstream mapFile("pin_node_map.dat");
   if (mapFile.is_open()) {
     for (const auto &p : pinNodeMap)
       mapFile << reinterpret_cast<uintptr_t>(p.first) << ","
@@ -502,63 +632,28 @@ void writeNetworkNodes(const Sta *sta, const std::string &filename,
 }
 
 
-// ---- writeNetworkArcs ----
-
 void writeNetworkArcs(const Sta *sta, const std::string &filename,
                       bool useInternalNodes) {
   std::ofstream csv(filename);
-  std::ofstream log("arcs_log.txt", std::ios::app);
+  std::ofstream log(kArcsCsvLog, std::ios::app);
   std::unordered_set<std::string> seen;
 
   if (!csv.is_open()) { log << "Cannot open " << filename << "\n"; return; }
 
   csv << "Source,Sink,NetName,Connection,"
         "Delay_Min_RR,Delay_Min_RF,Delay_Min_FR,Delay_Min_FF,"
-        "Delay_Max_RR,Delay_Max_RF,Delay_Max_FR,Delay_Max_FF,ArcType\n";
+        "Delay_Max_RR,Delay_Max_RF,Delay_Max_FR,Delay_Max_FF,"
+        "InputTransition_ns,OutputLoad_pf,ArcType\n";
 
   Network *network = sta->network();
   if (!network) return;
   Instance *top = network->topInstance();
   if (!top) return;
 
-  // Build in-memory pin-to-node-name map
+  // Reuse the same node naming policy as writeNetworkNodes().
   std::unordered_map<uintptr_t, std::string> pinMap;
-  {
-    auto reg = [&](Pin *pin, const std::string &inst) {
-      const PortDirection *dir = network->direction(pin);
-      std::string d = dir ? (dir->name() ? dir->name() : "unknown") : "unknown";
-      if (!useInternalNodes && d == "internal") return;
-      pinMap[reinterpret_cast<uintptr_t>(pin)] =
-          (inst == "top" || inst.empty()) ? safeStr(network->name(pin)) : inst + ":" + safeStr(network->name(pin));
-    };
-
-    InstancePinIterator *tpi = network->pinIterator(top);
-    if (tpi) {
-      while (Pin *p = tpi->next()) reg(p, "top");
-      delete tpi;
-    }
-
-    std::function<void(Instance*, const std::string&)> walk;
-    walk = [&](Instance *inst, const std::string &hier) {
-      std::string full;
-      if (inst != top) {
-        std::string in = safeStr(network->name(inst));
-        full = hier.empty() ? in : hier + "/" + in;
-        InstancePinIterator *pi = network->pinIterator(inst);
-        if (pi) {
-          while (Pin *p = pi->next()) reg(p, full);
-          delete pi;
-        }
-      }
-      InstanceChildIterator *ci = network->childIterator(inst);
-      if (ci) {
-        while (ci->hasNext()) walk(ci->next(), full);
-        delete ci;
-      }
-    };
-    walk(top, "");
-    log << "Pin map: " << pinMap.size() << " entries\n";
-  }
+  buildPinNodeMap(network, top, useInternalNodes, pinMap);
+  log << "Pin map: " << pinMap.size() << " entries\n";
 
   auto nodeName = [&](const Pin *pin) -> std::string {
     auto it = pinMap.find(reinterpret_cast<uintptr_t>(pin));
@@ -631,19 +726,7 @@ void writeNetworkArcs(const Sta *sta, const std::string &filename,
     return getAllEdgeDelays({edge});
   };
 
-  const int MAX_CONN = 1000000;
   int connCount = 0;
-
-  auto writeArc = [&](const std::string &src, const std::string &sink,
-                      const std::string &netName, const std::string &connType,
-                      const std::string &delays, const std::string &arcType) {
-    std::string id = src + "-" + sink;
-    if (!seen.insert(id).second) return;
-    csv << csvEscape(src) << "," << csvEscape(sink) << ","
-        << csvEscape(netName) << "," << connType << ","
-        << delays << "," << arcType << "\n";
-    connCount++;
-  };
 
   // Ensure the timing graph is built before any pass uses it.
   Graph *graph = sta->graph();
@@ -652,13 +735,79 @@ void writeNetworkArcs(const Sta *sta, const std::string &filename,
     graph = sta->graph();
   }
 
+  const Corner *cmdCorner = sta->cmdCorner();
+  const Corner *loadCorner = cmdCorner ? cmdCorner
+                                       : (sta->corners() && sta->corners()->count() > 0
+                                          ? sta->corners()->corners()[0]
+                                          : nullptr);
+  const DcalcAnalysisPt *loadAp = loadCorner
+                                  ? loadCorner->findDcalcAnalysisPt(MinMax::max())
+                                  : nullptr;
+  GraphDelayCalc *graphDelayCalc = const_cast<Sta*>(sta)->graphDelayCalc();
+
+  auto getInputTransition = [&](const Pin *src_pin) -> std::string {
+    if (!src_pin || !graph) return "N/A";
+    return evalOr<std::string>(
+        [&] {
+          Vertex *src_v = graph->pinDrvrVertex(const_cast<Pin*>(src_pin));
+          if (!src_v) src_v = graph->pinLoadVertex(const_cast<Pin*>(src_pin));
+          if (!src_v) return std::string("N/A");
+          return fmtFeatureNs(const_cast<Sta*>(sta)->vertexSlew(
+              src_v, RiseFall::rise(), MinMax::max()));
+        },
+        "N/A",
+        &log,
+        "Arc input transition extraction failed");
+  };
+
+  auto getOutputLoad = [&](const Pin *src_pin, const Pin *sink_pin) -> std::string {
+    std::string graph_load = evalOr<std::string>(
+        [&] {
+          if (!graphDelayCalc || !src_pin || !loadAp)
+            return std::string("N/A");
+          float load_cap = graphDelayCalc->loadCap(src_pin, loadAp);
+          if (!std::isnan(load_cap) && !std::isinf(load_cap) && load_cap >= 0.0f)
+            return fmtCapPf(load_cap);
+          return std::string("N/A");
+        },
+        "N/A",
+        &log,
+        "Arc output load extraction failed");
+    if (graph_load != "N/A")
+      return graph_load;
+
+    return evalOr<std::string>(
+        [&] {
+          LibertyPort *lp = sink_pin
+                                ? network->libertyPort(const_cast<Pin*>(sink_pin))
+                                : nullptr;
+          return lp ? fmtCapPf(lp->capacitance()) : std::string("N/A");
+        },
+        "N/A",
+        &log,
+        "Arc output-load fallback failed");
+  };
+
+  auto writeArc = [&](const std::string &src, const std::string &sink,
+                      const std::string &netName, const std::string &connType,
+                      const std::string &delays, const std::string &inputTransition,
+                      const std::string &outputLoad, const std::string &arcType) {
+    std::string id = src + "-" + sink;
+    if (!seen.insert(id).second) return;
+    csv << csvEscape(src) << "," << csvEscape(sink) << ","
+        << csvEscape(netName) << "," << connType << ","
+        << delays << "," << inputTransition << "," << outputLoad << ","
+        << arcType << "\n";
+    connCount++;
+  };
+
   // Pass 1: Net arcs (driver-to-load connections).
   log << "Processing net arcs...\n";
   int netArcCount = 0;
   NetIterator *ni = network->netIterator(top);
   if (ni) {
     while (Net *net = ni->next()) {
-      if (connCount >= MAX_CONN) break;
+      if (connCount >= kMaxConnections) break;
       const char *nn = network->name(net);
       std::string netName = nn ? nn : "UnnamedNet";
 
@@ -669,21 +818,20 @@ void writeNetworkArcs(const Sta *sta, const std::string &filename,
         std::string sn = nodeName(drv);
         if (sn.empty()) continue;
         const PortDirection *dd = network->direction(const_cast<Pin*>(drv));
-        if (!useInternalNodes && dd && dd->name() &&
-            std::string(dd->name()) == "internal")
+          if (skipInternalPin(dd, useInternalNodes))
           continue;
 
         PinConnectedPinIterator *ci = network->connectedPinIterator(net);
         if (!ci) continue;
         int pinCnt = 0;
         while (const Pin *ld = ci->next()) {
-          if (++pinCnt > 5000 || connCount >= MAX_CONN) break;
+          // Large clock/reset nets can be huge; cap per-net expansion for CSV usability.
+          if (++pinCnt > kMaxPinsPerNet || connCount >= kMaxConnections) break;
           if (ld == drv) continue;
           std::string tn = nodeName(ld);
           if (tn.empty()) continue;
           const PortDirection *ld_d = network->direction(const_cast<Pin*>(ld));
-          if (!useInternalNodes && ld_d && ld_d->name() &&
-              std::string(ld_d->name()) == "internal")
+          if (skipInternalPin(ld_d, useInternalNodes))
             continue;
 
           // Find graph edge for delay.
@@ -703,6 +851,8 @@ void writeNetworkArcs(const Sta *sta, const std::string &filename,
           }
           writeArc(sn, tn, netName, "net",
                    target ? getEdgeDelays(target) : "N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A",
+                   getInputTransition(drv),
+                   getOutputLoad(drv, ld),
                    "net_arc");
           netArcCount++;
         }
@@ -772,9 +922,11 @@ void writeNetworkArcs(const Sta *sta, const std::string &filename,
       writeArc(sn, tn, "cell_internal", "internal",
                targets.empty() ? "N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A"
                                : getAllEdgeDelays(targets),
-               "timing_arc");
+               getInputTransition(fpin),
+               getOutputLoad(tpin, tpin),
+               "cell_arc");
       cellArcCount++;
-      if (connCount >= MAX_CONN) return;
+      if (connCount >= kMaxConnections) return;
     }
   };
 
@@ -794,14 +946,14 @@ void writeNetworkArcs(const Sta *sta, const std::string &filename,
     log << "Processing internal wire arcs...\n";
     int wireArcCount = 0;
     VertexIterator vi(graph);
-    while (vi.hasNext() && connCount < MAX_CONN) {
+    while (vi.hasNext() && connCount < kMaxConnections) {
       Vertex *fv = vi.next();
       const Pin *fp = fv->pin();
       std::string sn = nodeName(fp);
       if (sn.empty()) continue;
 
       VertexOutEdgeIterator ei(fv, graph);
-      while (ei.hasNext() && connCount < MAX_CONN) {
+      while (ei.hasNext() && connCount < kMaxConnections) {
         Edge *e = ei.next();
         if (e->role() != TimingRole::wire()) continue;
         const Pin *tp = e->to(graph)->pin();
@@ -811,7 +963,10 @@ void writeNetworkArcs(const Sta *sta, const std::string &filename,
             network->isTopLevelPort(const_cast<Pin*>(tp)))
           continue;
         writeArc(sn, tn, "internal_net", "internal",
-                 getEdgeDelays(e), "internal_arc");
+                 getEdgeDelays(e),
+                 getInputTransition(fp),
+                 getOutputLoad(fp, tp),
+                 "internal_arc");
         wireArcCount++;
       }
     }
@@ -822,12 +977,10 @@ void writeNetworkArcs(const Sta *sta, const std::string &filename,
 }
 
 
-// ---- writePinPropertiesCsv ----
-
 void writePinPropertiesCsv(const Sta *sta, const std::string &filename,
                            const std::string &spef_file) {
   std::ofstream csv(filename);
-  std::ofstream log("pin_properties_debug.txt");
+  std::ofstream log(kPinPropsCsvLog);
   if (!csv.is_open()) { log << "Cannot open " << filename << "\n"; return; }
 
   csv << "FullName,Direction,IsPort,IsHierarchical,IsRegisterClock,"
@@ -860,9 +1013,13 @@ void writePinPropertiesCsv(const Sta *sta, const std::string &filename,
   if (!top) return;
 
   if (!graph) {
-    try { sm->ensureGraph(); graph = sta->graph(); } catch (...) {}
+    runSafely([&] { sm->ensureGraph(); graph = sta->graph(); },
+              &log,
+              "Pin-properties graph initialization failed");
   }
-  try { sm->search(); } catch (...) {}
+  runSafely([&] { sm->search(); },
+            &log,
+            "Pin-properties timing search initialization failed");
 
   // Build clock domain mapping
   std::map<Pin*, std::set<std::string>> pinClkDomains;
@@ -871,19 +1028,23 @@ void writePinPropertiesCsv(const Sta *sta, const std::string &filename,
 
   // Default clock period for toggle rate computation
   float clkPeriod = 10e-9f;
-  try {
-    if (sdc) {
-      ClockSeq *clks = sdc->clocks();
-      if (clks && !clks->empty() && (*clks)[0])
-        clkPeriod = (*clks)[0]->period();
-    }
-  } catch (...) {}
+  clkPeriod = evalOr<float>(
+      [&] {
+        if (!sdc)
+          return clkPeriod;
+        ClockSeq *clks = sdc->clocks();
+        return (clks && !clks->empty() && (*clks)[0])
+            ? (*clks)[0]->period()
+            : clkPeriod;
+      },
+      clkPeriod,
+      &log,
+      "Pin-properties clock period lookup failed");
 
   // Pin processing lambda
   auto processPin = [&](Pin *pin, const std::string &fullName, bool isPort) {
     if (!pin) return;
-    try {
-      std::string pname = safeStr(network->name(pin));
+    std::string pname = safeStr(network->name(pin));
 
       // Direction
       std::string dir = "unknown";
@@ -903,22 +1064,36 @@ void writePinPropertiesCsv(const Sta *sta, const std::string &filename,
         }
       }
 
-      bool isHier = false;
-      try { isHier = network->isHierarchical(pin); } catch (...) {}
+      bool isHier = evalOr<bool>(
+          [&] { return network->isHierarchical(pin); },
+          false,
+          &log,
+          "Pin hierarchy lookup failed");
       bool isRegClk = false;
       std::string libPin = "N/A", libPort = "N/A";
       std::string cap = "N/A", drvRes = "N/A";
 
-      try {
-        LibertyPort *lp = network->libertyPort(pin);
-        if (lp) {
-          libPin = safeStr(lp->name());
-          libPort = libPin;
-          isRegClk = lp->isRegClk();
-          try { cap = fmtCapPf(lp->capacitance()); } catch (...) {}
-          try { drvRes = fmtResOhm(lp->driveResistance()); } catch (...) {}
-        }
-      } catch (...) {}
+      runSafely(
+          [&] {
+            LibertyPort *lp = network->libertyPort(pin);
+            if (!lp)
+              return;
+            libPin = safeStr(lp->name());
+            libPort = libPin;
+            isRegClk = lp->isRegClk();
+            cap = evalOr<std::string>(
+                [&] { return fmtCapPf(lp->capacitance()); },
+                "N/A",
+                &log,
+                "Pin capacitance extraction failed");
+            drvRes = evalOr<std::string>(
+                [&] { return fmtResOhm(lp->driveResistance()); },
+                "N/A",
+                &log,
+                "Pin drive-resistance extraction failed");
+          },
+          &log,
+          "Liberty pin lookup failed");
 
       // Timing: slew and slack
       std::string sr = "N/A", sf = "N/A", smr = "N/A", smf = "N/A";
@@ -926,31 +1101,38 @@ void writePinPropertiesCsv(const Sta *sta, const std::string &filename,
       std::string skmr = "N/A", skmf = "N/A", skmw = "N/A";
 
       if (graph && sm) {
-        try {
-          Vertex *dv = graph->pinDrvrVertex(pin);
-          Vertex *lv = graph->pinLoadVertex(pin);
-          Vertex *v = dv ? dv : lv;
-          if (v) {
-            try {
-              sr = fmtTimingNs(sm->vertexSlew(v, RiseFall::rise(), MinMax::max()));
-              sf = fmtTimingNs(sm->vertexSlew(v, RiseFall::fall(), MinMax::max()));
-            } catch (...) {}
-            try {
-              smr = fmtTimingNs(sm->vertexSlew(v, RiseFall::rise(), MinMax::min()));
-              smf = fmtTimingNs(sm->vertexSlew(v, RiseFall::fall(), MinMax::min()));
-            } catch (...) {}
-            try {
-              skr = fmtTimingNs(sm->vertexSlack(v, RiseFall::rise(), MinMax::max()));
-              skf = fmtTimingNs(sm->vertexSlack(v, RiseFall::fall(), MinMax::max()));
-              skw = fmtTimingNs(sm->vertexSlack(v, MinMax::max()));
-            } catch (...) {}
-            try {
-              skmr = fmtTimingNs(sm->vertexSlack(v, RiseFall::rise(), MinMax::min()));
-              skmf = fmtTimingNs(sm->vertexSlack(v, RiseFall::fall(), MinMax::min()));
-              skmw = fmtTimingNs(sm->vertexSlack(v, MinMax::min()));
-            } catch (...) {}
-          }
-        } catch (...) {}
+        runSafely(
+            [&] {
+              Vertex *dv = graph->pinDrvrVertex(pin);
+              Vertex *lv = graph->pinLoadVertex(pin);
+              Vertex *v = dv ? dv : lv;
+              if (!v)
+                return;
+              runSafely(
+                  [&] {
+                    sr = fmtTimingNs(sm->vertexSlew(v, RiseFall::rise(), MinMax::max()));
+                    sf = fmtTimingNs(sm->vertexSlew(v, RiseFall::fall(), MinMax::max()));
+                  });
+              runSafely(
+                  [&] {
+                    smr = fmtTimingNs(sm->vertexSlew(v, RiseFall::rise(), MinMax::min()));
+                    smf = fmtTimingNs(sm->vertexSlew(v, RiseFall::fall(), MinMax::min()));
+                  });
+              runSafely(
+                  [&] {
+                    skr = fmtTimingNs(sm->vertexSlack(v, RiseFall::rise(), MinMax::max()));
+                    skf = fmtTimingNs(sm->vertexSlack(v, RiseFall::fall(), MinMax::max()));
+                    skw = fmtTimingNs(sm->vertexSlack(v, MinMax::max()));
+                  });
+              runSafely(
+                  [&] {
+                    skmr = fmtTimingNs(sm->vertexSlack(v, RiseFall::rise(), MinMax::min()));
+                    skmf = fmtTimingNs(sm->vertexSlack(v, RiseFall::fall(), MinMax::min()));
+                    skmw = fmtTimingNs(sm->vertexSlack(v, MinMax::min()));
+                  });
+            },
+            &log,
+            "Pin timing extraction failed");
       }
 
       // Clock info
@@ -1020,72 +1202,67 @@ void writePinPropertiesCsv(const Sta *sta, const std::string &filename,
           << cap << "," << drvRes << ","
           << act << "," << sprob << "," << trate << "," << aorigin << ","
           << cx << "," << cy << "\n";
-    } catch (...) {
-      log << "Exception processing pin " << fullName << "\n";
-    }
   };
 
   // Process top-level ports
-  try {
-    InstancePinIterator *tpi = network->pinIterator(top);
-    if (tpi) {
-      while (Pin *pin = tpi->next())
-        if (pin) processPin(pin, "top/" + safeStr(network->name(pin)), true);
-      delete tpi;
-    }
-  } catch (...) {}
+  runSafely(
+      [&] {
+        InstancePinIterator *tpi = network->pinIterator(top);
+        if (tpi) {
+          while (Pin *pin = tpi->next())
+            if (pin) processPin(pin, "top/" + safeStr(network->name(pin)), true);
+          delete tpi;
+        }
+      },
+      &log,
+      "Top-level pin export failed");
 
   // Process leaf instances
-  try {
-    LeafInstanceIterator *li = network->leafInstanceIterator();
-    if (li) {
-      while (li->hasNext()) {
-        Instance *inst = li->next();
-        if (!inst || inst == top) continue;
-        std::string iname = safeStr(network->name(inst));
-        try {
+  runSafely(
+      [&] {
+        LeafInstanceIterator *li = network->leafInstanceIterator();
+        if (!li)
+          return;
+        while (li->hasNext()) {
+          Instance *inst = li->next();
+          if (!inst || inst == top) continue;
+          std::string iname = safeStr(network->name(inst));
           InstancePinIterator *pi = network->pinIterator(inst);
           if (pi) {
             while (Pin *pin = pi->next())
               if (pin) processPin(pin, iname + "/" + safeStr(network->name(pin)), false);
             delete pi;
           }
-        } catch (...) {}
-      }
-      delete li;
-    }
-  } catch (...) {}
+        }
+        delete li;
+      },
+      &log,
+      "Leaf-instance pin export failed");
 
   // Process hierarchical instance pins
   std::function<void(Instance*, const std::string&)> procHier;
   procHier = [&](Instance *parent, const std::string &path) {
-    try {
-      InstanceChildIterator *ci = network->childIterator(parent);
-      if (!ci) return;
-      while (ci->hasNext()) {
-        Instance *child = ci->next();
-        if (!child || !network->isHierarchical(child)) continue;
-        std::string cp = path.empty() ? safeStr(network->name(child))
-                                      : path + "/" + safeStr(network->name(child));
-        try {
-          InstancePinIterator *pi = network->pinIterator(child);
-          if (pi) {
-            while (Pin *pin = pi->next())
-              if (pin) processPin(pin, cp + "/" + safeStr(network->name(pin)), false);
-            delete pi;
-          }
-        } catch (...) {}
-        procHier(child, cp);
+    InstanceChildIterator *ci = network->childIterator(parent);
+    if (!ci) return;
+    while (ci->hasNext()) {
+      Instance *child = ci->next();
+      if (!child || !network->isHierarchical(child)) continue;
+      std::string cp = path.empty() ? safeStr(network->name(child))
+                                    : path + "/" + safeStr(network->name(child));
+      InstancePinIterator *pi = network->pinIterator(child);
+      if (pi) {
+        while (Pin *pin = pi->next())
+          if (pin) processPin(pin, cp + "/" + safeStr(network->name(pin)), false);
+        delete pi;
       }
-      delete ci;
-    } catch (...) {}
+      procHier(child, cp);
+    }
+    delete ci;
   };
   procHier(top, "");
   csv.close();
 }
 
-
-// ---- writeCellPropertiesCsv ----
 
 void writeCellPropertiesCsv(const Sta *sta, const std::string &filename) {
   std::ofstream csv(filename);
@@ -1113,9 +1290,13 @@ void writeCellPropertiesCsv(const Sta *sta, const std::string &filename) {
 
 
   if (!graph) {
-    try { sm->ensureGraph(); graph = sta->graph(); } catch (...) {}
+    runSafely([&] { sm->ensureGraph(); graph = sta->graph(); },
+              &log,
+              "Cell-properties graph initialization failed");
   }
-  try { sm->search(); } catch (...) {}
+  runSafely([&] { sm->search(); },
+            &log,
+            "Cell-properties timing search initialization failed");
 
   // Clock domain mapping
   std::map<Pin*, std::set<std::string>> pinClkDomains;
@@ -1129,31 +1310,29 @@ void writeCellPropertiesCsv(const Sta *sta, const std::string &filename) {
     bool hasClk = false;
     std::set<std::string> clkNames;
     if (!inst) return {false, "N/A"};
-    try {
-      InstancePinIterator *pi = network->pinIterator(inst);
-      if (!pi) return {false, "N/A"};
-      int pc = 0;
-      while (pi->hasNext() && pc < 50) {
-        pc++;
-        try {
-          Pin *pin = pi->next();
-          if (!pin) continue;
-          LibertyPort *lp = network->libertyPort(pin);
-          if (!lp || !lp->isRegClk()) continue;
-          hasClk = true;
-          if (pinClkDomains.count(pin))
-            for (const auto &c : pinClkDomains[pin]) clkNames.insert(c);
-        } catch (...) {}
-      }
-      delete pi;
-    } catch (...) {}
+    InstancePinIterator *pi = network->pinIterator(inst);
+    if (!pi) return {false, "N/A"};
+    int pc = 0;
+    while (pi->hasNext() && pc < 50) {
+      pc++;
+      Pin *pin = pi->next();
+      if (!pin) continue;
+      LibertyPort *lp = evalOr<LibertyPort*>(
+          [&] { return network->libertyPort(pin); },
+          nullptr);
+      if (!lp || !lp->isRegClk()) continue;
+      hasClk = true;
+      if (pinClkDomains.count(pin))
+        for (const auto &c : pinClkDomains[pin]) clkNames.insert(c);
+    }
+    delete pi;
     return {hasClk, joinSet(clkNames)};
   };
 
   // Main cell processing lambda
   auto processCell = [&](Instance *inst, const std::string &fullName) {
     if (!inst || inst == top) return;
-    try {
+    runSafely([&] {
       const char *inc = network->name(inst);
       if (!inc) return;
       std::string iname(inc);
@@ -1189,96 +1368,88 @@ void writeCellPropertiesCsv(const Sta *sta, const std::string &filename) {
         lc->leakagePower(lv, le);
         if (le) leakPwr = fmtPowerPw(lv);
       }
-      try { isHier = network->isHierarchical(inst); } catch (...) {}
+      isHier = evalOr<bool>([&] { return network->isHierarchical(inst); }, false);
 
       // Pin counting
       int pinCnt = 0, inCnt = 0, outCnt = 0, biCnt = 0;
       int clkCnt = 0, dataCnt = 0, asyncCnt = 0;
       float inCap = 0, outCap = 0;
-      try {
-        InstancePinIterator *pi = network->pinIterator(inst);
-        if (pi) {
-          int lim = 0;
-          while (pi->hasNext() && lim < 100) {
-            lim++;
-            try {
-              Pin *pin = pi->next();
-              if (!pin) continue;
-              const PortDirection *d = network->direction(pin);
-              if (d && d->isPowerGround()) continue;
-              pinCnt++;
-              if (d && d->isInput()) {
-                inCnt++;
-                bool isClkP = false, isAsync = false;
-                try {
-                  LibertyPort *lp = network->libertyPort(pin);
-                  if (lp) {
-                    isClkP = lp->isRegClk() || lp->isClockGateClock() || lp->isClock();
-                    if (!isClkP && lp->isCheckClk()) isAsync = true;
-                    float c = lp->capacitance();
-                    if (!std::isnan(c) && c > 0 && c < 1e-6) inCap += c;
-                  }
-                } catch (...) {}
-                if (isClkP) clkCnt++; else if (isAsync) asyncCnt++;
-              } else if (d && d->isOutput()) {
-                outCnt++;
-                try {
-                  LibertyPort *lp = network->libertyPort(pin);
-                  if (lp) {
-                    float c = lp->capacitance();
-                    if (!std::isnan(c) && c > 0 && c < 1e-6) outCap += c;
-                  }
-                } catch (...) {}
-              } else if (d && d->isBidirect()) biCnt++;
-            } catch (...) {}
+      InstancePinIterator *pi = network->pinIterator(inst);
+      if (pi) {
+        int lim = 0;
+        while (pi->hasNext() && lim < 100) {
+          lim++;
+          Pin *pin = pi->next();
+          if (!pin) continue;
+          const PortDirection *d = network->direction(pin);
+          if (d && d->isPowerGround()) continue;
+          pinCnt++;
+          if (d && d->isInput()) {
+            inCnt++;
+            bool isClkP = false, isAsync = false;
+            LibertyPort *lp = evalOr<LibertyPort*>([&] { return network->libertyPort(pin); }, nullptr);
+            if (lp) {
+              isClkP = lp->isRegClk() || lp->isClockGateClock() || lp->isClock();
+              if (!isClkP && lp->isCheckClk()) isAsync = true;
+              float c = lp->capacitance();
+              if (!std::isnan(c) && c > 0 && c < 1e-6) inCap += c;
+            }
+            if (isClkP) clkCnt++; else if (isAsync) asyncCnt++;
+          } else if (d && d->isOutput()) {
+            outCnt++;
+            LibertyPort *lp = evalOr<LibertyPort*>([&] { return network->libertyPort(pin); }, nullptr);
+            if (lp) {
+              float c = lp->capacitance();
+              if (!std::isnan(c) && c > 0 && c < 1e-6) outCap += c;
+            }
+          } else if (d && d->isBidirect()) {
+            biCnt++;
           }
-          delete pi;
         }
-      } catch (...) {}
+        delete pi;
+      }
 
       pinCnt = inCnt + outCnt + biCnt;
       dataCnt = pinCnt - clkCnt - asyncCnt;
 
       // Fanout/fanin load counting
       int foLoad = 0, fiLoad = 0;
-      try {
-        InstancePinIterator *fi = network->pinIterator(inst);
-        if (fi) {
-          while (fi->hasNext()) {
-            Pin *pin = fi->next();
-            if (!pin) continue;
-            Net *pn = network->net(pin);
-            if (!pn) continue;
-            const PortDirection *pd = network->direction(pin);
-            if (!pd || pd->isPowerGround()) continue;
-            if (pd->isOutput() || pd->isBidirect()) {
-              NetConnectedPinIterator *cp = network->connectedPinIterator(pn);
-              if (cp) {
-                while (cp->hasNext()) {
-                  const Pin *p = cp->next();
-                  if (p != pin && network->isLoad(p)) foLoad++;
-                }
-                delete cp;
+      InstancePinIterator *fi = network->pinIterator(inst);
+      if (fi) {
+        while (fi->hasNext()) {
+          Pin *pin = fi->next();
+          if (!pin) continue;
+          Net *pn = network->net(pin);
+          if (!pn) continue;
+          const PortDirection *pd = network->direction(pin);
+          if (!pd || pd->isPowerGround()) continue;
+          if (pd->isOutput() || pd->isBidirect()) {
+            NetConnectedPinIterator *cp = network->connectedPinIterator(pn);
+            if (cp) {
+              while (cp->hasNext()) {
+                const Pin *p = cp->next();
+                if (p != pin && network->isLoad(p)) foLoad++;
               }
-            } else if (pd->isInput()) {
-              NetConnectedPinIterator *cp = network->connectedPinIterator(pn);
-              if (cp) {
-                while (cp->hasNext()) {
-                  const Pin *p = cp->next();
-                  if (p != pin && network->isDriver(p)) fiLoad++;
-                }
-                delete cp;
+              delete cp;
+            }
+          } else if (pd->isInput()) {
+            NetConnectedPinIterator *cp = network->connectedPinIterator(pn);
+            if (cp) {
+              while (cp->hasNext()) {
+                const Pin *p = cp->next();
+                if (p != pin && network->isDriver(p)) fiLoad++;
               }
+              delete cp;
             }
           }
-          delete fi;
         }
-      } catch (...) {}
+        delete fi;
+      }
 
 
 
       bool isComb = true, isSeq = false, isClkGate = false;
-      if (lc) try { isClkGate = lc->isClockGate(); } catch (...) {}
+      isClkGate = lc ? evalOr<bool>([&] { return lc->isClockGate(); }, false) : false;
       if (clkCnt > 0 || isClkGate) { isSeq = true; isComb = false; }
       if (cellType == "combinational" || cellType == "unknown") {
         if (isClkGate) cellType = "clock_gating";
@@ -1288,93 +1459,102 @@ void writeCellPropertiesCsv(const Sta *sta, const std::string &filename) {
       // Timing: setup, hold
       std::string setupT = "N/A", holdT = "N/A";
       int arcCount = 0;
-      if (lc) try { arcCount = lc->timingArcSets().size(); } catch (...) {}
+      arcCount = lc ? evalOr<int>([&] { return lc->timingArcSets().size(); }, 0) : 0;
 
-      try {
-        float mSetup = -1e10f, mHold = -1e10f;
-        InstancePinIterator *pi = network->pinIterator(inst);
-        if (pi) {
-          const Corner *corner = sta->cmdCorner();
-          DcalcAnalysisPt *apMin = corner ? corner->findDcalcAnalysisPt(MinMax::min()) : nullptr;
-          DcalcAnalysisPt *apMax = corner ? corner->findDcalcAnalysisPt(MinMax::max()) : nullptr;
-          while (pi->hasNext()) {
-            Pin *pin = pi->next();
-            if (!pin) continue;
-            Vertex *v = graph->pinLoadVertex(pin);
-            if (!v) continue;
-            VertexOutEdgeIterator ei(v, graph);
-            while (ei.hasNext()) {
-              Edge *e = ei.next();
-              if (!e) continue;
-              TimingArcSet *as = e->timingArcSet();
-              if (!as || !as->role()) continue;
-              const TimingRole *role = as->role();
-              Vertex *tv = e->to(graph);
-              if (!tv || !tv->pin() || network->instance(tv->pin()) != inst) continue;
-              DcalcAnalysisPt *ap = (role == TimingRole::hold() ||
-                                     role == TimingRole::nonSeqHold()) ? apMin : apMax;
-              if (!ap) continue;
-              float md = -INF;
-              if (!as->arcs().empty()) {
-                for (TimingArc *a : as->arcs()) {
-                  float d = sm->arcDelay(e, a, ap);
+      runSafely(
+          [&] {
+            float mSetup = -1e10f, mHold = -1e10f;
+            InstancePinIterator *pi = network->pinIterator(inst);
+            if (!pi)
+              return;
+            const Corner *corner = sta->cmdCorner();
+            DcalcAnalysisPt *apMin = corner ? corner->findDcalcAnalysisPt(MinMax::min()) : nullptr;
+            DcalcAnalysisPt *apMax = corner ? corner->findDcalcAnalysisPt(MinMax::max()) : nullptr;
+            while (pi->hasNext()) {
+              Pin *pin = pi->next();
+              if (!pin) continue;
+              Vertex *v = graph->pinLoadVertex(pin);
+              if (!v) continue;
+              VertexOutEdgeIterator ei(v, graph);
+              while (ei.hasNext()) {
+                Edge *e = ei.next();
+                if (!e) continue;
+                TimingArcSet *as = e->timingArcSet();
+                if (!as || !as->role()) continue;
+                const TimingRole *role = as->role();
+                Vertex *tv = e->to(graph);
+                if (!tv || !tv->pin() || network->instance(tv->pin()) != inst) continue;
+                DcalcAnalysisPt *ap = (role == TimingRole::hold() ||
+                                       role == TimingRole::nonSeqHold()) ? apMin : apMax;
+                if (!ap) continue;
+                float md = -INF;
+                if (!as->arcs().empty()) {
+                  for (TimingArc *a : as->arcs()) {
+                    float d = sm->arcDelay(e, a, ap);
+                    if (!std::isnan(d) && d != INF && d != -INF) md = std::max(md, d);
+                  }
+                } else {
+                  float d = sm->arcDelay(e, nullptr, ap);
                   if (!std::isnan(d) && d != INF && d != -INF) md = std::max(md, d);
                 }
-              } else {
-                float d = sm->arcDelay(e, nullptr, ap);
-                if (!std::isnan(d) && d != INF && d != -INF) md = std::max(md, d);
+                if (md == -INF) continue;
+                if (role == TimingRole::setup() || role == TimingRole::nonSeqSetup()) mSetup = std::max(mSetup, md);
+                else if (role == TimingRole::hold() || role == TimingRole::nonSeqHold()) mHold = std::max(mHold, md);
               }
-              if (md == -INF) continue;
-              if (role == TimingRole::setup() || role == TimingRole::nonSeqSetup()) mSetup = std::max(mSetup, md);
-              else if (role == TimingRole::hold() || role == TimingRole::nonSeqHold()) mHold = std::max(mHold, md);
             }
-          }
-          delete pi;
-          if (mSetup > -1e9f) setupT = fmtTimingNs3(mSetup);
-          if (mHold > -1e9f) holdT = fmtTimingNs3(mHold);
-        }
-      } catch (...) {}
+            delete pi;
+            if (mSetup > -1e9f) setupT = fmtTimingNs3(mSetup);
+            if (mHold > -1e9f) holdT = fmtTimingNs3(mHold);
+          },
+          &log,
+          "Cell timing-check extraction failed");
 
       auto [hasClkIn, clkDomains] = getClockInfo(inst);
 
       // Power analysis
       std::string swPwr = "N/A", intPwr = "N/A", totPwr = "N/A";
-      try {
-        const Corner *corner = sta->cmdCorner();
-        if (corner) {
-          PowerResult pwr = sm->power(inst, corner);
-          if (!std::isnan(pwr.switching())) swPwr = fmtPowerPw(pwr.switching());
-          if (!std::isnan(pwr.internal())) intPwr = fmtPowerPw(pwr.internal());
-          if (!std::isnan(pwr.total())) totPwr = fmtPowerPw(pwr.total());
-        }
-      } catch (...) {}
+      runSafely(
+          [&] {
+            const Corner *corner = sta->cmdCorner();
+            if (!corner)
+              return;
+            PowerResult pwr = sm->power(inst, corner);
+            if (!std::isnan(pwr.switching())) swPwr = fmtPowerPw(pwr.switching());
+            if (!std::isnan(pwr.internal())) intPwr = fmtPowerPw(pwr.internal());
+            if (!std::isnan(pwr.total())) totPwr = fmtPowerPw(pwr.total());
+          },
+          &log,
+          "Cell power extraction failed");
 
       // PVT extraction: instance -> global operating conditions -> library default
       std::string pvtProc = "N/A", pvtVolt = "N/A", pvtTemp = "N/A";
       std::string threshGrp = "N/A", opCond = "typical", procCorner = "tt";
-      try {
-        float pr = 0, vo = 0, te = 0;
-        bool found = false;
-        const Pvt *ipvt = sta->sdc()->pvt(inst, MinMax::max());
-        if (ipvt) { pr = ipvt->process(); vo = ipvt->voltage(); te = ipvt->temperature(); found = true; }
-        if (!found) {
-          OperatingConditions *gop = sta->sdc()->operatingConditions(MinMax::max());
-          if (gop) { pr = gop->process(); vo = gop->voltage(); te = gop->temperature(); found = true; }
-        }
-        if (!found && lc) {
-          LibertyLibrary *lib = lc->libertyLibrary();
-          if (lib) {
-            OperatingConditions *dop = lib->defaultOperatingConditions();
-            if (dop) { pr = dop->process(); vo = dop->voltage(); te = dop->temperature(); found = true; }
-          }
-        }
-        if (found) {
-          std::ostringstream o;
-          o << std::fixed << std::setprecision(4) << pr; pvtProc = o.str();
-          o.str(""); o << std::fixed << std::setprecision(4) << vo; pvtVolt = o.str();
-          o.str(""); o << std::fixed << std::setprecision(2) << te; pvtTemp = o.str();
-        }
-      } catch (...) {}
+      runSafely(
+          [&] {
+            float pr = 0, vo = 0, te = 0;
+            bool found = false;
+            const Pvt *ipvt = sta->sdc()->pvt(inst, MinMax::max());
+            if (ipvt) { pr = ipvt->process(); vo = ipvt->voltage(); te = ipvt->temperature(); found = true; }
+            if (!found) {
+              OperatingConditions *gop = sta->sdc()->operatingConditions(MinMax::max());
+              if (gop) { pr = gop->process(); vo = gop->voltage(); te = gop->temperature(); found = true; }
+            }
+            if (!found && lc) {
+              LibertyLibrary *lib = lc->libertyLibrary();
+              if (lib) {
+                OperatingConditions *dop = lib->defaultOperatingConditions();
+                if (dop) { pr = dop->process(); vo = dop->voltage(); te = dop->temperature(); found = true; }
+              }
+            }
+            if (found) {
+              std::ostringstream o;
+              o << std::fixed << std::setprecision(4) << pr; pvtProc = o.str();
+              o.str(""); o << std::fixed << std::setprecision(4) << vo; pvtVolt = o.str();
+              o.str(""); o << std::fixed << std::setprecision(2) << te; pvtTemp = o.str();
+            }
+          },
+          &log,
+          "Cell PVT extraction failed");
 
       csv << fullName << "," << cellName << "," << libName << ","
           << cellType << ","
@@ -1391,60 +1571,61 @@ void writeCellPropertiesCsv(const Sta *sta, const std::string &filename) {
           << (hasClkIn?"true":"false") << "," << clkDomains << ","
           << swPwr << "," << intPwr << "," << totPwr << ","
           << pvtProc << "," << pvtVolt << "," << pvtTemp << "\n";
-    } catch (...) {
-      log << "Exception processing " << fullName << "\n";
-    }
+    },
+    &log,
+    "Cell property extraction failed");
   };
 
   // Pass 1: Leaf instances
   log << "Processing leaf instances...\n";
-  try {
-    LeafInstanceIterator *li = network->leafInstanceIterator();
-    if (li) {
-      int cnt = 0;
-      while (li->hasNext()) {
-        try {
+  runSafely(
+      [&] {
+        LeafInstanceIterator *li = network->leafInstanceIterator();
+        if (!li)
+          return;
+        int cnt = 0;
+        while (li->hasNext()) {
           Instance *inst = li->next();
           if (!inst || inst == top) continue;
           cnt++;
           if (cnt % 1000 == 0) { log << "Processed " << cnt << " instances\n"; csv.flush(); }
           processCell(inst, safeStr(network->pathName(inst)));
-        } catch (...) {}
-      }
-      delete li;
-      log << "Leaf instances: " << cnt << "\n";
-    }
-  } catch (...) {}
+        }
+        delete li;
+        log << "Leaf instances: " << cnt << "\n";
+      },
+      &log,
+      "Leaf cell export failed");
 
   // Pass 2: Hierarchical instances
   log << "Processing hierarchical instances...\n";
-  try {
-    int hc = 0;
-    std::function<void(Instance*)> walkHier = [&](Instance *parent) {
-      if (!parent) return;
-      InstanceChildIterator *ci = network->childIterator(parent);
-      if (!ci) return;
-      while (ci->hasNext()) {
-        try {
-          Instance *child = ci->next();
-          if (!child || child == top || !network->isHierarchical(child)) continue;
-          hc++;
-          processCell(child, safeStr(network->pathName(child)));
-          walkHier(child);
-        } catch (...) {}
-      }
-      delete ci;
-    };
-    walkHier(top);
-    log << "Hierarchical instances: " << hc << "\n";
-  } catch (...) {}
+  runSafely(
+      [&] {
+        int hc = 0;
+        std::function<void(Instance*)> walkHier = [&](Instance *parent) {
+          if (!parent) return;
+          InstanceChildIterator *ci = network->childIterator(parent);
+          if (!ci) return;
+          while (ci->hasNext()) {
+            Instance *child = ci->next();
+            if (!child || child == top || !network->isHierarchical(child)) continue;
+            hc++;
+            processCell(child, safeStr(network->pathName(child)));
+            walkHier(child);
+          }
+          delete ci;
+        };
+        walkHier(top);
+        log << "Hierarchical instances: " << hc << "\n";
+      },
+      &log,
+      "Hierarchical cell export failed");
 
   csv.close();
 }
 
 
-// ---- writeInstancePropertiesBenchmark ----
-// Extracts only Tcl get_property accessible fields for speedup comparison.
+// Export a minimal instance-property subset for FEASTA-vs-Tcl throughput comparisons.
 
 void writeInstancePropertiesBenchmark(const Sta *sta, const std::string &filename) {
   const Network *network = sta->network();
@@ -1461,31 +1642,29 @@ void writeInstancePropertiesBenchmark(const Sta *sta, const std::string &filenam
   while (li->hasNext()) {
     Instance *inst = li->next();
     if (!inst) continue;
-    try {
-      std::string fullName = safeStr(network->pathName(inst));
-      std::string name = safeStr(network->name(inst));
-      const Cell *cell = network->cell(inst);
-      std::string refName = safeStr(cell ? network->name(cell) : nullptr);
+    std::string fullName = safeStr(network->pathName(inst));
+    std::string name = safeStr(network->name(inst));
+    const Cell *cell = network->cell(inst);
+    std::string refName = safeStr(cell ? network->name(cell) : nullptr);
 
-      const LibertyCell *lc = network->libertyCell(inst);
-      std::string lcName = "";
-      bool isBuf = false, isInv = false, isMacro = false;
-      bool isMem = false, isClkGate = false;
-      if (lc) {
-        lcName = safeStr(lc->name());
-        isBuf = lc->isBuffer(); isInv = lc->isInverter();
-        isMacro = lc->isMacro(); isMem = lc->isMemory();
-        isClkGate = lc->isClockGate();
-      }
-      bool isHier = !network->isLeaf(inst);
+    const LibertyCell *lc = network->libertyCell(inst);
+    std::string lcName = "";
+    bool isBuf = false, isInv = false, isMacro = false;
+    bool isMem = false, isClkGate = false;
+    if (lc) {
+      lcName = safeStr(lc->name());
+      isBuf = lc->isBuffer(); isInv = lc->isInverter();
+      isMacro = lc->isMacro(); isMem = lc->isMemory();
+      isClkGate = lc->isClockGate();
+    }
+    bool isHier = !network->isLeaf(inst);
 
-      csv << csvEscape(fullName) << "," << csvEscape(name) << ","
-          << csvEscape(refName) << "," << csvEscape(lcName) << ","
-          << (isBuf?"true":"false") << "," << (isInv?"true":"false") << ","
-          << (isMacro?"true":"false") << "," << (isMem?"true":"false") << ","
-          << (isClkGate?"true":"false") << "," << (isHier?"true":"false") << "\n";
-      count++;
-    } catch (...) {}
+    csv << csvEscape(fullName) << "," << csvEscape(name) << ","
+        << csvEscape(refName) << "," << csvEscape(lcName) << ","
+        << (isBuf?"true":"false") << "," << (isInv?"true":"false") << ","
+        << (isMacro?"true":"false") << "," << (isMem?"true":"false") << ","
+        << (isClkGate?"true":"false") << "," << (isHier?"true":"false") << "\n";
+    count++;
   }
   delete li;
   csv.close();

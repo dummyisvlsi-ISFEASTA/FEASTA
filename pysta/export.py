@@ -1,9 +1,4 @@
-"""
-PySTA Tensor Bridge
-
-Export circuit data to ML-ready formats with feature-specific normalization.
-Supports PyTorch Geometric, NumPy, and pandas exports.
-"""
+"""Export FEASTA data into ML-oriented tensor and array formats."""
 
 from typing import Any, Dict, List, Optional, Tuple, Union
 import warnings
@@ -11,7 +6,6 @@ import warnings
 import pandas as pd
 import numpy as np
 
-# Optional imports for ML frameworks
 try:
     import torch
     TORCH_AVAILABLE = True
@@ -24,26 +18,10 @@ try:
 except ImportError:
     PYGEOM_AVAILABLE = False
 
-
-# =============================================================================
-# NORMALIZATION STRATEGIES
-# =============================================================================
-
 class Normalizer:
-    """
-    Feature-specific normalization with inverse transform support.
-    
-    Strategies:
-    - "none": No scaling (for slack - preserve sign and zero boundary)
-    - "log": Log scaling log(1 + x) (for power-law distributions)
-    - "minmax": Min-Max to [0, 1] (for coordinates)
-    - "zscore": Z-score normalization (mean=0, std=1)
-    - "divide": Divide by constant
-    """
-    
-    # Default strategies per feature type
+    """Column-wise normalization with inverse-transform support."""
+
     DEFAULT_STRATEGIES = {
-        # Timing - preserve sign
         "SlackRise_ns": "none",
         "SlackFall_ns": "none",
         "SlackWorst_ns": "none",
@@ -51,11 +29,9 @@ class Normalizer:
         "SlackMinFall_ns": "none",
         "SlackMinWorst_ns": "none",
         
-        # Slew - divide by typical clock period (1ns)
         "SlewRise_ns": {"type": "divide", "divisor": 1.0},
         "SlewFall_ns": {"type": "divide", "divisor": 1.0},
-        
-        # Power-law distributions - log scale
+
         "Capacitance_pf": "log",
         "DriveResistance_ohm": "log",
         "Area_um2": "log",
@@ -65,33 +41,20 @@ class Normalizer:
         "FaninLoad": "log",
         "PinCount": "log",
         
-        # Coordinates - minmax
         "CoordX_um": "minmax",
         "CoordY_um": "minmax",
-        
-        # Already normalized
+
         "Activity": "none",
         "StaticProbability": "none",
-        
-        # Logic depth - relative
+
         "LogicDepthFromInput": "minmax",
         "LogicDepthToOutput": "minmax",
     }
     
     def __init__(self, custom_strategies: Optional[Dict] = None):
-        """
-        Initialize normalizer.
-        
-        Parameters
-        ----------
-        custom_strategies : dict, optional
-            Override default strategies for specific columns.
-        """
         self.strategies = self.DEFAULT_STRATEGIES.copy()
         if custom_strategies:
             self.strategies.update(custom_strategies)
-        
-        # Store parameters for inverse transform
         self._params: Dict[str, Dict] = {}
     
     def fit_transform(
@@ -99,21 +62,7 @@ class Normalizer:
         df: pd.DataFrame,
         columns: List[str]
     ) -> pd.DataFrame:
-        """
-        Fit normalizer and transform data.
-        
-        Parameters
-        ----------
-        df : pd.DataFrame
-            Input data.
-        columns : list
-            Columns to normalize.
-            
-        Returns
-        -------
-        pd.DataFrame
-            Normalized data.
-        """
+        """Fit on `columns` and return a normalized copy of `df`."""
         result = df.copy()
         
         for col in columns:
@@ -123,7 +72,6 @@ class Normalizer:
             strategy = self.strategies.get(col, "minmax")
             values = df[col].values.astype(np.float32)
             
-            # Handle NaN
             nan_mask = np.isnan(values)
             
             if isinstance(strategy, dict):
@@ -132,20 +80,16 @@ class Normalizer:
                 strategy_type = strategy
             
             if strategy_type == "none":
-                # No transformation
                 self._params[col] = {"type": "none"}
                 normalized = values
                 
             elif strategy_type == "log":
-                # Log transform: log(1 + x)
-                # Handle negative values by shifting
                 min_val = np.nanmin(values)
                 shift = max(0, -min_val + 1e-6)
                 normalized = np.log1p(values + shift)
                 self._params[col] = {"type": "log", "shift": shift}
                 
             elif strategy_type == "minmax":
-                # Min-Max scaling
                 min_val = np.nanmin(values)
                 max_val = np.nanmax(values)
                 range_val = max_val - min_val
@@ -155,7 +99,6 @@ class Normalizer:
                 self._params[col] = {"type": "minmax", "min": min_val, "range": range_val}
                 
             elif strategy_type == "zscore":
-                # Z-score normalization
                 mean_val = np.nanmean(values)
                 std_val = np.nanstd(values)
                 if std_val == 0:
@@ -164,7 +107,6 @@ class Normalizer:
                 self._params[col] = {"type": "zscore", "mean": mean_val, "std": std_val}
                 
             elif strategy_type == "divide":
-                # Divide by constant
                 if isinstance(strategy, dict):
                     divisor = strategy.get("divisor", 1.0)
                 else:
@@ -173,11 +115,9 @@ class Normalizer:
                 self._params[col] = {"type": "divide", "divisor": divisor}
                 
             else:
-                # Default: no transformation
                 normalized = values
                 self._params[col] = {"type": "none"}
-            
-            # Restore NaN
+
             normalized[nan_mask] = np.nan
             result[col] = normalized
         
@@ -188,21 +128,7 @@ class Normalizer:
         values: np.ndarray,
         column: str
     ) -> np.ndarray:
-        """
-        Inverse transform normalized values back to original scale.
-        
-        Parameters
-        ----------
-        values : np.ndarray
-            Normalized values.
-        column : str
-            Column name (to lookup transformation params).
-            
-        Returns
-        -------
-        np.ndarray
-            Original-scale values.
-        """
+        """Map normalized values for `column` back to the original scale."""
         if column not in self._params:
             return values
         
@@ -236,29 +162,8 @@ class Normalizer:
         """Get stored normalization parameters."""
         return self._params.copy()
 
-
-# =============================================================================
-# TENSOR BRIDGE CLASS
-# =============================================================================
-
 class TensorBridge:
-    """
-    Export circuit data to ML-ready tensor formats.
-    
-    Features:
-    - Feature-specific normalization (preserve slack sign, log-scale powers)
-    - Edge weights for GNN convolution
-    - PyTorch Geometric Data export
-    - NumPy array export
-    
-    Example:
-        >>> bridge = TensorBridge(design)
-        >>> data = bridge.to_pytorch_geometric(
-        ...     node_features=["SlewRise_ns", "Capacitance_pf", "LogicDepthFromInput"],
-        ...     edge_weight="Delay",
-        ...     target="SlackWorst_ns"
-        ... )
-    """
+    """Bridge pandas-backed FEASTA data into tensor-oriented formats."""
     
     def __init__(
         self,
@@ -286,10 +191,6 @@ class TensorBridge:
         self._name_to_id = name_to_id or {}
         
         self._normalizer = Normalizer(custom_normalization)
-    
-    # =========================================================================
-    # PYTORCH GEOMETRIC EXPORT
-    # =========================================================================
     
     def to_pytorch_geometric(
         self,
@@ -386,56 +287,44 @@ class TensorBridge:
     ) -> Tuple[Any, Any, Any]:
         """Build edge tensors from arcs DataFrame."""
         if self._arcs_df is None or self._arcs_df.empty:
-            # Empty graph
             edge_index = torch.empty((2, 0), dtype=torch.long)
-            edge_weight = torch.empty(0, dtype=torch.float)
-            return edge_index, edge_weight, None
-        
-        arcs = self._arcs_df
-        
-        # Get source and sink IDs
+            return edge_index, torch.empty(0, dtype=torch.float), None
+
+        arcs = self._arcs_df.copy()
+
+        # Resolve source/sink to integer IDs.
         if "_source_id" in arcs.columns and "_sink_id" in arcs.columns:
-            sources = arcs["_source_id"].dropna().astype(int).values
-            sinks = arcs["_sink_id"].dropna().astype(int).values
+            arcs = arcs.rename(columns={"_source_id": "_src", "_sink_id": "_snk"})
+        elif "Source" in arcs.columns and "Sink" in arcs.columns:
+            arcs["_src"] = arcs["Source"].map(self._name_to_id)
+            arcs["_snk"] = arcs["Sink"].map(self._name_to_id)
         else:
-            # Need to map names to IDs
-            if "Source" in arcs.columns and "Sink" in arcs.columns:
-                sources = arcs["Source"].map(self._name_to_id).dropna().astype(int).values
-                sinks = arcs["Sink"].map(self._name_to_id).dropna().astype(int).values
-            else:
-                edge_index = torch.empty((2, 0), dtype=torch.long)
-                edge_weight = torch.empty(0, dtype=torch.float)
-                return edge_index, edge_weight, None
-        
-        # Filter to valid pairs
-        min_len = min(len(sources), len(sinks))
-        sources = sources[:min_len]
-        sinks = sinks[:min_len]
-        
-        # Build edge_index
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            return edge_index, torch.empty(0, dtype=torch.float), None
+
+        # Drop rows where either endpoint is unmapped; keeps pairs aligned.
+        arcs = arcs.dropna(subset=["_src", "_snk"])
+        sources = arcs["_src"].astype(int).values
+        sinks = arcs["_snk"].astype(int).values
+
         edge_index = torch.tensor(np.vstack([sources, sinks]), dtype=torch.long)
-        
-        # Build edge_weight (CRITICAL: used for GNN convolution)
+
+        # Edge weights (used by GNN convolution).
         if edge_weight_col and edge_weight_col in arcs.columns:
-            weights = arcs[edge_weight_col].fillna(fill_value).values[:min_len].astype(np.float32)
+            weights = arcs[edge_weight_col].fillna(fill_value).values.astype(np.float32)
         else:
-            weights = np.ones(min_len, dtype=np.float32)
-        
+            weights = np.ones(len(sources), dtype=np.float32)
         edge_weight = torch.tensor(weights, dtype=torch.float)
-        
-        # Build edge_attr (optional additional features)
+
+        # Optional additional edge features.
         edge_attr = None
         if edge_features:
             available = [f for f in edge_features if f in arcs.columns]
             if available:
-                attr_data = arcs[available].fillna(fill_value).values[:min_len].astype(np.float32)
+                attr_data = arcs[available].fillna(fill_value).values.astype(np.float32)
                 edge_attr = torch.tensor(attr_data, dtype=torch.float)
-        
+
         return edge_index, edge_weight, edge_attr
-    
-    # =========================================================================
-    # NUMPY EXPORT
-    # =========================================================================
     
     def to_numpy(
         self,
@@ -482,10 +371,6 @@ class TensorBridge:
         
         return X, y
     
-    # =========================================================================
-    # DATAFRAME EXPORT
-    # =========================================================================
-    
     def to_dataframe(
         self,
         features: List[str],
@@ -524,10 +409,6 @@ class TensorBridge:
         
         return result
     
-    # =========================================================================
-    # INVERSE TRANSFORM
-    # =========================================================================
-    
     def inverse_transform(
         self,
         values: np.ndarray,
@@ -549,10 +430,6 @@ class TensorBridge:
             Values in original scale.
         """
         return self._normalizer.inverse_transform(values, feature_name)
-    
-    # =========================================================================
-    # UTILITIES
-    # =========================================================================
     
     def get_available_features(self) -> List[str]:
         """Get list of available feature columns."""

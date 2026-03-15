@@ -34,8 +34,10 @@
 #include "Sta.hh"
 #include "csv/csvWriter.hh"
 #include "csv/SpefParser.hh"
-#include <fstream>
 #include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sstream>
 
 namespace sta {
 
@@ -181,6 +183,41 @@ void registerDumpCsvDataCmd(Tcl_Interp* interp, Sta* sta)
     Tcl_CreateCommand(interp, "dump_csv_data", dumpCsvDataCmd, sta, nullptr);
 }
 
+static bool
+parseNetworkCsvArgs(Tcl_Interp* interp,
+                    int argc,
+                    const char* argv[],
+                    const char* default_filename,
+                    const char*& filename,
+                    bool& use_internal_nodes)
+{
+    filename = default_filename;
+    use_internal_nodes = false;
+
+    if (argc > 3) {
+        Tcl_SetResult(interp,
+                      const_cast<char*>("Usage: <command> [<output_csv_file>] [-use_internal_nodes]"),
+                      TCL_STATIC);
+        return false;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], "-use_internal_nodes") == 0) {
+            use_internal_nodes = true;
+        }
+        else if (filename == default_filename) {
+            filename = argv[i];
+        }
+        else {
+            Tcl_SetResult(interp,
+                          const_cast<char*>("Usage: <command> [<output_csv_file>] [-use_internal_nodes]"),
+                          TCL_STATIC);
+            return false;
+        }
+    }
+    return true;
+}
+
 static int
 dumpNetworkNodesCmd(ClientData clientData, Tcl_Interp* interp, int argc, const char* argv[])
 {
@@ -190,9 +227,14 @@ dumpNetworkNodesCmd(ClientData clientData, Tcl_Interp* interp, int argc, const c
         return TCL_ERROR;
     }
     const char* filename = "network_nodes.csv";
-    bool useInternalNodes = (argc > 1 && std::strcmp(argv[1], "-use_internal_nodes") == 0);
+    bool useInternalNodes = false;
+    if (!parseNetworkCsvArgs(interp, argc, argv, "network_nodes.csv",
+                             filename, useInternalNodes)) {
+        return TCL_ERROR;
+    }
     writeNetworkNodes(sta, filename, useInternalNodes);
-    Tcl_SetResult(interp, const_cast<char*>("Network nodes written to network_nodes.csv"), TCL_STATIC);
+    std::string result = std::string("Network nodes written to ") + filename;
+    Tcl_SetResult(interp, const_cast<char*>(result.c_str()), TCL_VOLATILE);
     return TCL_OK;
 }
 
@@ -205,9 +247,14 @@ dumpNetworkArcsCmd(ClientData clientData, Tcl_Interp* interp, int argc, const ch
         return TCL_ERROR;
     }
     const char* filename = "network_arcs.csv";
-    bool useInternalNodes = (argc > 1 && std::strcmp(argv[1], "-use_internal_nodes") == 0);
+    bool useInternalNodes = false;
+    if (!parseNetworkCsvArgs(interp, argc, argv, "network_arcs.csv",
+                             filename, useInternalNodes)) {
+        return TCL_ERROR;
+    }
     writeNetworkArcs(sta, filename, useInternalNodes);
-    Tcl_SetResult(interp, const_cast<char*>("Network arcs written to network_arcs.csv"), TCL_STATIC);
+    std::string result = std::string("Network arcs written to ") + filename;
+    Tcl_SetResult(interp, const_cast<char*>(result.c_str()), TCL_VOLATILE);
     return TCL_OK;
 }
 
@@ -220,12 +267,12 @@ writePinPropertiesCmd(ClientData clientData, Tcl_Interp* interp, int argc, const
         return TCL_ERROR;
     }
     
-    // Usage: dump_pin_properties [output_csv] [spef_file]
+    // Usage: write_pin_properties [output_csv] [spef_file]
     const char* filename = "pin_properties.csv";
     std::string spef_file = "";
     
     if (argc > 3) {
-        Tcl_SetResult(interp, const_cast<char*>("Usage: dump_pin_properties [<output_csv_file>] [<spef_file>]"), TCL_STATIC);
+        Tcl_SetResult(interp, const_cast<char*>("Usage: write_pin_properties [<output_csv_file>] [<spef_file>]"), TCL_STATIC);
         return TCL_ERROR;
     }
     if (argc >= 2) {
@@ -248,7 +295,7 @@ static int
 dumpPinCoordsCmd(ClientData /*clientData*/, Tcl_Interp* interp, int argc, const char* argv[])
 {
     if (argc != 3) {
-        Tcl_SetResult(interp, const_cast<char*>("Usage: dump_pin_coords <spef_file> <output_csv_file>"), TCL_STATIC);
+        Tcl_SetResult(interp, const_cast<char*>("Usage: write_pin_coords <spef_file> <output_csv_file>"), TCL_STATIC);
         return TCL_ERROR;
     }
     SpefParser parser;
@@ -367,11 +414,11 @@ getPinCoordsCmd(ClientData /*clientData*/, Tcl_Interp* interp, int argc, const c
 
 void registerNetworkGraphCmds(Tcl_Interp* interp, Sta* sta)
 {
-    Tcl_CreateCommand(interp, "dump_network_nodes", dumpNetworkNodesCmd, sta, nullptr);
-    Tcl_CreateCommand(interp, "dump_network_arcs", dumpNetworkArcsCmd, sta, nullptr);
-    Tcl_CreateCommand(interp, "dump_pin_properties", writePinPropertiesCmd, sta, nullptr);
-    Tcl_CreateCommand(interp, "dump_cell_properties", writeCellPropertiesCmd, sta, nullptr);
-    Tcl_CreateCommand(interp, "dump_pin_coords", dumpPinCoordsCmd, sta, nullptr);
+    Tcl_CreateCommand(interp, "write_network_nodes", dumpNetworkNodesCmd, sta, nullptr);
+    Tcl_CreateCommand(interp, "write_network_arcs", dumpNetworkArcsCmd, sta, nullptr);
+    Tcl_CreateCommand(interp, "write_pin_properties", writePinPropertiesCmd, sta, nullptr);
+    Tcl_CreateCommand(interp, "write_cell_properties", writeCellPropertiesCmd, sta, nullptr);
+    Tcl_CreateCommand(interp, "write_pin_coords", dumpPinCoordsCmd, sta, nullptr);
     Tcl_CreateCommand(interp, "get_pin_coords", getPinCoordsCmd, sta, nullptr);
 }
 

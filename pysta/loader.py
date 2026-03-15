@@ -1,9 +1,4 @@
-"""
-PySTA Design Loader
-
-The core loader that ingests OpenSTA CSV exports into a validated,
-indexed, zero-copy in-memory representation with topology analysis.
-"""
+"""Load FEASTA CSV exports into indexed pandas DataFrames."""
 
 import os
 import time
@@ -31,11 +26,6 @@ from .topology import TopologyBuilder, build_topology
 from .query import QueryEngine, FilterableDataFrame
 from .export import TensorBridge
 
-
-# =============================================================================
-# EXPECTED FILES
-# =============================================================================
-
 EXPECTED_FILES = {
     "network_nodes": "network_nodes.csv",
     "network_arcs": "network_arcs.csv",
@@ -43,37 +33,8 @@ EXPECTED_FILES = {
     "cell_properties": "cell_properties.csv"
 }
 
-
-# =============================================================================
-# DESIGN CLASS
-# =============================================================================
-
 class Design:
-    """
-    The core design object that holds all timing analysis data.
-    
-    This class performs:
-    1. Automatic CSV detection and loading
-    2. Hash-based indexing for O(1) node lookups
-    3. Schema validation and type optimization
-    4. Zero-copy data merging
-    5. Topology construction with cycle detection
-    6. Logic depth computation via BFS
-    
-    Attributes:
-        name (str): Design identifier
-        nodes (DataFrame): All pins/nodes with properties
-        arcs (DataFrame): All connectivity edges
-        cells (DataFrame): Cell/instance-level properties
-        pins (FilterableDataFrame): Nodes with filter/traversal methods
-        metadata (dict): Design statistics and schema info
-    
-    Example:
-        >>> design = Design("./dumps/zipcpu/")
-        >>> print(design.summary())
-        >>> violations = design.pins.filter(SlackWorst_ns__lt=0)
-        >>> data = design.to_pytorch_geometric(node_features=["SlewRise_ns", "Capacitance_pf"])
-    """
+    """Loaded design data plus optional topology and query helpers."""
     
     def __init__(
         self,
@@ -84,30 +45,6 @@ class Design:
         verbose: bool = True,
         lazy_topology: bool = True
     ):
-        """
-        Initialize a Design object from OpenSTA CSV exports.
-        
-        Parameters
-        ----------
-        path : str
-            Path to directory containing CSV files from OpenSTA dump.
-            
-        name : str, optional
-            Human-readable design name. If None, inferred from directory.
-            
-        validate : bool, default=True
-            Perform schema validation on load.
-            
-        optimize_memory : bool, default=True
-            Optimize dtypes to reduce memory usage.
-            
-        verbose : bool, default=True
-            Print loading progress.
-            
-        lazy_topology : bool, default=True
-            If True, defer topology building until first graph traversal.
-            This reduces initial load time significantly for large designs.
-        """
         self._start_time = time.time()
         self._path = Path(path)
         self._name = name or self._path.name
@@ -117,61 +54,34 @@ class Design:
         self._lazy_topology = lazy_topology
         self._topology_built = False
         
-        # Internal storage
         self._nodes_df: Optional[pd.DataFrame] = None
         self._arcs_df: Optional[pd.DataFrame] = None
         self._cells_df: Optional[pd.DataFrame] = None
         self._pin_properties_df: Optional[pd.DataFrame] = None
         
-        # Index structures
         self._name_to_id: Dict[str, int] = {}
         self._id_to_name: Dict[int, str] = {}
         
-        # Topology
         self._topology: Optional[TopologyBuilder] = None
         
-        # Query engine (created lazily)
         self._query_engine: Optional[QueryEngine] = None
         self._tensor_bridge: Optional[TensorBridge] = None
         
-        # Metadata
         self._metadata: Dict[str, Any] = {}
         self._warnings: List[str] = []
-        
-        # Load the design
         self._load()
     
-    # =========================================================================
-    # LOADING
-    # =========================================================================
-    
     def _load(self):
-        """Main loading sequence."""
+        """Load all available CSV inputs and optional topology."""
         self._log("Loading design from", str(self._path))
-        
-        # Step 1: File discovery
         self._discover_files()
-        
-        # Step 2: Load nodes (creates master index)
         self._load_nodes()
-        
-        # Step 3: Load arcs
         self._load_arcs()
-        
-        # Step 4: Load cells
         self._load_cells()
-        
-        # Step 5: Load and merge pin properties
         self._load_pin_properties()
-        
-        # Step 6: Build topology (CSR + cycle detection + logic depth)
-        # Deferred if lazy_topology=True (default) for faster loading
         if not self._lazy_topology:
             self._build_topology()
-        
-        # Step 7: Build metadata
         self._build_metadata()
-        
         self._log(f"Load complete in {self._metadata['load_time_sec']:.2f}s")
     
     def _discover_files(self):
@@ -192,7 +102,6 @@ class Design:
             else:
                 missing.append(filename)
         
-        # network_nodes is required, others are optional
         if "network_nodes" not in self._files:
             raise LoadError(
                 f"Required file 'network_nodes.csv' not found in {self._path}"
@@ -207,31 +116,23 @@ class Design:
         
         filepath = self._files["network_nodes"]
         
-        # Try PyArrow C++ engine first (10x faster), fall back if CSV has issues
         try:
             df = pd.read_csv(filepath, engine="pyarrow", dtype_backend="pyarrow")
         except Exception as e:
             self._log(f"  PyArrow failed ({e}), using default engine...")
             df = pd.read_csv(filepath, on_bad_lines="skip")
         
-        # Validate schema
         if self._validate:
             warnings = validate_schema(df, "network_nodes", str(filepath))
             self._warnings.extend(warnings)
         
-        # Cast types
         df = cast_types(df, "network_nodes")
-        
-        # Build primary index from Name column
         if "Name" not in df.columns:
             raise SchemaError("Column 'Name' not found in network_nodes.csv")
         
         self._name_to_id, self._id_to_name = build_name_index(df["Name"])
         
-        # Add integer ID column
         df["_node_id"] = df["Name"].map(self._name_to_id)
-        
-        # Optimize memory
         if self._optimize_memory:
             df = optimize_dtypes(df)
         
@@ -249,28 +150,22 @@ class Design:
         
         filepath = self._files["network_arcs"]
         
-        # Try PyArrow C++ engine first (10x faster), fall back if CSV has issues
         try:
             df = pd.read_csv(filepath, engine="pyarrow", dtype_backend="pyarrow")
         except Exception as e:
             self._log(f"  PyArrow failed ({e}), using default engine...")
             df = pd.read_csv(filepath, on_bad_lines="skip")
         
-        # Validate schema
         if self._validate:
             warnings = validate_schema(df, "network_arcs", str(filepath))
             self._warnings.extend(warnings)
         
-        # Cast types
         df = cast_types(df, "network_arcs")
-        
-        # Map Source/Sink to integer IDs
         if "Source" in df.columns:
             df["_source_id"] = df["Source"].map(self._name_to_id)
         if "Sink" in df.columns:
             df["_sink_id"] = df["Sink"].map(self._name_to_id)
         
-        # Optimize memory
         if self._optimize_memory:
             df = optimize_dtypes(df)
         
@@ -287,22 +182,17 @@ class Design:
         
         filepath = self._files["cell_properties"]
         
-        # Try PyArrow C++ engine first (10x faster), fall back if CSV has issues
         try:
             df = pd.read_csv(filepath, engine="pyarrow", dtype_backend="pyarrow")
         except Exception as e:
             self._log(f"  PyArrow failed ({e}), using default engine...")
             df = pd.read_csv(filepath, on_bad_lines="skip")
         
-        # Validate schema
         if self._validate:
             warnings = validate_schema(df, "cell_properties", str(filepath))
             self._warnings.extend(warnings)
         
-        # Cast types
         df = cast_types(df, "cell_properties")
-        
-        # Optimize memory
         if self._optimize_memory:
             df = optimize_dtypes(df)
         
@@ -310,7 +200,7 @@ class Design:
         self._log(f"  Loaded {len(df)} cells")
     
     def _load_pin_properties(self):
-        """Load pin_properties.csv and merge with nodes (zero-copy)."""
+        """Load pin_properties.csv and merge it into the node table."""
         if "pin_properties" not in self._files:
             return
         
@@ -318,26 +208,22 @@ class Design:
         
         filepath = self._files["pin_properties"]
         
-        # Try PyArrow C++ engine first (10x faster), fall back if CSV has issues
         try:
             df = pd.read_csv(filepath, engine="pyarrow", dtype_backend="pyarrow")
         except Exception as e:
             self._log(f"  PyArrow failed ({e}), using default engine...")
             df = pd.read_csv(filepath, on_bad_lines="skip")
         
-        # Validate schema
         if self._validate:
             warnings = validate_schema(df, "pin_properties", str(filepath))
             self._warnings.extend(warnings)
         
-        # Cast types
         df = cast_types(df, "pin_properties")
         
         self._pin_properties_df = df
         self._log(f"  Loaded {len(df)} pin properties")
         
-        # Zero-copy merge with nodes
-        self._log("  Merging with nodes (zero-copy)...")
+        self._log("  Merging with nodes...")
         if "FullName" in df.columns and "Name" not in df.columns:
             df = df.rename(columns={"FullName": "Name"})
         self._nodes_df = fast_merge_by_index(
@@ -347,27 +233,23 @@ class Design:
         )
     
     def _build_topology(self):
-        """Build graph topology, detect cycles, compute logic depth."""
+        """Build graph topology and derived depth information."""
         if self._topology_built:
-            return  # Already built
+            return
             
         self._log("Building topology...")
         
-        # Build topology using helper function
         self._topology = build_topology(self._nodes_df, self._arcs_df)
-        
-        # Add logic depth columns to nodes
         if self._topology.depth_from_input is not None:
             self._nodes_df["LogicDepthFromInput"] = self._topology.depth_from_input
         if self._topology.depth_to_output is not None:
             self._nodes_df["LogicDepthToOutput"] = self._topology.depth_to_output
         
-        # Get stats
         topo_stats = self._topology.get_stats()
         self._log(f"  Edges: {topo_stats['num_edges']}")
         
         if topo_stats["has_cycles"]:
-            self._log(f"  ⚠ Cycles detected: {topo_stats['num_cycle_edges']} back-edges")
+            self._log(f"  Cycles detected: {topo_stats['num_cycle_edges']} back-edges")
             self._warnings.append(f"Design has {topo_stats['num_cycle_edges']} feedback loops")
         
         if topo_stats["max_depth_from_input"] >= 0:
@@ -376,7 +258,7 @@ class Design:
         self._topology_built = True
     
     def _ensure_topology(self):
-        """Lazily build topology on first access."""
+        """Build topology the first time it is requested."""
         if not self._topology_built:
             self._build_topology()
     
@@ -396,7 +278,7 @@ class Design:
             "memory_mb": self._get_total_memory(),
             "has_coordinates": self._has_column("CoordX_um"),
             "has_timing": self._has_column("SlackWorst_ns"),
-            "has_power": self._has_column("Activity"),
+            "has_power": self._cells_df is not None and "LeakagePower_pW" in (self._cells_df.columns if self._cells_df is not None else []),
             "has_cycles": topo_stats.get("has_cycles", False),
             "num_cycle_edges": topo_stats.get("num_cycle_edges", 0),
             "max_logic_depth": topo_stats.get("max_depth_from_input", -1),
@@ -421,13 +303,9 @@ class Design:
         return col in self._nodes_df.columns
     
     def _log(self, *args):
-        """Emit log message at INFO level if verbose mode is enabled."""
+        """Print a log line when verbose output is enabled."""
         if self._verbose:
-            logger.info(" ".join(str(a) for a in args))
-    
-    # =========================================================================
-    # PROPERTIES
-    # =========================================================================
+            print(" ".join(str(a) for a in args))
     
     @property
     def name(self) -> str:
@@ -436,23 +314,12 @@ class Design:
     
     @property
     def nodes(self) -> pd.DataFrame:
-        """
-        All network nodes (pins) with their properties.
-        
-        Includes structural, timing, power, and computed features (LogicDepth).
-        """
+        """Node table."""
         return self._nodes_df
-    
+
     @property
     def pins(self) -> "FilterableDataFrame":
-        """
-        Nodes with filter, traversal, and critical path methods.
-        
-        Example:
-            >>> design.pins.filter(SlackWorst_ns__lt=0)
-            >>> design.pins.get_fanout("reg/Q", depth=3)
-            >>> design.pins.get_critical_paths(top_k=10)
-        """
+        """Node table with query helpers attached."""
         return FilterableDataFrame(
             self._nodes_df,
             self._topology,
@@ -462,35 +329,26 @@ class Design:
     
     @property
     def arcs(self) -> pd.DataFrame:
-        """All connectivity arcs between nodes."""
+        """Arc table."""
         return self._arcs_df
     
     @property
     def cells(self) -> pd.DataFrame:
-        """All cell/instance properties."""
+        """Cell table."""
         return self._cells_df
     
     @property
     def metadata(self) -> Dict[str, Any]:
-        """Design statistics and schema information."""
+        """Design metadata."""
         return self._metadata
     
     @property
     def topology(self) -> TopologyBuilder:
-        """Topology builder with adjacency matrices and graph algorithms."""
+        """Topology view."""
         return self._topology
     
-    # =========================================================================
-    # QUERY METHODS
-    # =========================================================================
-    
     def filter(self, **conditions) -> pd.DataFrame:
-        """
-        Filter nodes using Django-style conditions.
-        
-        Example:
-            >>> design.filter(SlackWorst_ns__lt=0, IsClock=True)
-        """
+        """Filter nodes."""
         qe = QueryEngine(
             self._nodes_df, self._topology,
             self._name_to_id, self._id_to_name
@@ -498,7 +356,7 @@ class Design:
         return qe.filter(**conditions)
     
     def get_fanin(self, node_name: str, depth: int = 1) -> pd.DataFrame:
-        """Get fanin cone of a node."""
+        """Return a node's fanin cone."""
         qe = QueryEngine(
             self._nodes_df, self._topology,
             self._name_to_id, self._id_to_name
@@ -506,7 +364,7 @@ class Design:
         return qe.get_fanin(node_name, depth)
     
     def get_fanout(self, node_name: str, depth: int = 1) -> pd.DataFrame:
-        """Get fanout cone of a node."""
+        """Return a node's fanout cone."""
         qe = QueryEngine(
             self._nodes_df, self._topology,
             self._name_to_id, self._id_to_name
@@ -514,19 +372,15 @@ class Design:
         return qe.get_fanout(node_name, depth)
     
     def get_critical_paths(self, top_k: int = 10) -> List[Dict]:
-        """Get top-K critical timing paths."""
+        """Return critical paths."""
         qe = QueryEngine(
             self._nodes_df, self._topology,
             self._name_to_id, self._id_to_name
         )
         return qe.get_critical_paths(top_k)
     
-    # =========================================================================
-    # INDEX ACCESS
-    # =========================================================================
-    
     def get_node(self, name: str) -> pd.Series:
-        """O(1) lookup of a single node by name."""
+        """Return one node by name."""
         if name not in self._name_to_id:
             raise KeyError(f"Node '{name}' not found in design")
         
@@ -534,20 +388,16 @@ class Design:
         return self._nodes_df[self._nodes_df["_node_id"] == node_id].iloc[0]
     
     def get_node_id(self, name: str) -> int:
-        """Get integer ID for a node name."""
+        """Return the integer ID for a node name."""
         if name not in self._name_to_id:
             raise KeyError(f"Node '{name}' not found in design")
         return self._name_to_id[name]
     
     def get_node_name(self, node_id: int) -> str:
-        """Get name for an integer node ID."""
+        """Return the node name for an integer ID."""
         if node_id not in self._id_to_name:
             raise KeyError(f"Node ID {node_id} not found in design")
         return self._id_to_name[node_id]
-    
-    # =========================================================================
-    # EXPORT METHODS
-    # =========================================================================
     
     def to_pytorch_geometric(
         self,
@@ -557,27 +407,7 @@ class Design:
         target: Optional[str] = None,
         normalize: bool = True
     ):
-        """
-        Export to PyTorch Geometric Data object.
-        
-        Parameters
-        ----------
-        node_features : list
-            Node feature columns (e.g., ["SlewRise_ns", "Capacitance_pf"])
-        edge_weight : str, default="Delay"
-            Edge weight column (for GNN convolution).
-        edge_features : list, optional
-            Additional edge features.
-        target : str, optional
-            Target column for prediction (y).
-        normalize : bool, default=True
-            Apply feature-specific normalization.
-            
-        Returns
-        -------
-        torch_geometric.data.Data
-            Graph data with x, edge_index, edge_weight, y.
-        """
+        """Export to a PyTorch Geometric data object."""
         bridge = TensorBridge(
             self._nodes_df, self._arcs_df, self._name_to_id
         )
@@ -591,22 +421,14 @@ class Design:
         target: Optional[str] = None,
         normalize: bool = True
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        """
-        Export to NumPy arrays (for scikit-learn, XGBoost).
-        
-        Returns (X, y) tuple.
-        """
+        """Export node features and optional target to NumPy arrays."""
         bridge = TensorBridge(
             self._nodes_df, self._arcs_df, self._name_to_id
         )
         return bridge.to_numpy(features, target, normalize)
     
-    # =========================================================================
-    # SUMMARY
-    # =========================================================================
-    
     def summary(self) -> str:
-        """Generate human-readable design summary."""
+        """Return a text summary of the loaded design."""
         lines = [
             "╔" + "═" * 50 + "╗",
             f"║ Design: {self._name:<41} ║",

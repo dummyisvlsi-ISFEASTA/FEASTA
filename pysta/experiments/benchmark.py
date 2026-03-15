@@ -1,14 +1,4 @@
-"""
-PySTA Benchmark Script
-
-Compare PySTA's performance against traditional approaches for:
-1. Design loading
-2. Query operations
-3. ML data preparation
-
-Usage:
-    python benchmark.py --pysta_path ../tests/zipcpu_verification/src/
-"""
+"""Ad hoc benchmark helpers for PySTA loading, queries, and graph prep."""
 
 import sys
 import os
@@ -16,7 +6,6 @@ import time
 import argparse
 import gc
 
-# Add PySTA to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ['DGLBACKEND'] = 'pytorch'
@@ -75,8 +64,6 @@ def benchmark_loading(pysta_path, runs=3):
     print(f"  Arcs: {num_arcs:,}")
     print(f"  PySTA Load Time: {format_time(avg_time)} (+/-{format_time(std_time)})")
     
-    # Estimated traditional TCL time (based on CircuitNet benchmarks)
-    # TCL loop overhead: ~0.5ms per node for basic property access
     est_tcl_time = num_nodes * 0.0005  # Conservative estimate
     
     print(f"  Est. Traditional Time: {format_time(est_tcl_time)}")
@@ -99,7 +86,6 @@ def benchmark_filtering(design, runs=10):
     
     results = []
     
-    # Test 1: Find all timing violations
     print("\n  [2.1] Find Timing Violations (slack < 0)")
     times = []
     for _ in range(runs):
@@ -121,7 +107,6 @@ def benchmark_filtering(design, runs=10):
         'traditional_time': est_tcl
     })
     
-    # Test 2: Filter by capacitance
     print("\n  [2.2] Filter High Capacitance (> 0.5pF)")
     times = []
     for _ in range(runs):
@@ -143,7 +128,6 @@ def benchmark_filtering(design, runs=10):
         'traditional_time': est_tcl
     })
     
-    # Test 3: Multi-condition filter
     print("\n  [2.3] Multi-condition Filter (slack < 0 AND cap > 0.1)")
     times = []
     for _ in range(runs):
@@ -184,10 +168,8 @@ def benchmark_ml_preparation(design, device='cpu', runs=3):
     
     avg_convert = np.mean(times_convert)
     
-    # Re-create for stats
     g = pysta_to_dgl_graph(design, device=device, verbose=False)
-    
-    # Feature extraction time
+
     t0 = time.time()
     features = g.ndata['nf']
     _ = features.shape
@@ -199,8 +181,6 @@ def benchmark_ml_preparation(design, device='cpu', runs=3):
     print(f"  Graph Edges: {g.num_edges('net_out'):,}")
     print(f"  Feature Shape: {features.shape}")
     
-    # Traditional: Reading from files + building graph manually
-    # Estimated based on CircuitNet build_graph.py performance
     est_traditional = len(design.nodes) * 0.0001 + len(design.arcs) * 0.00005
     
     print(f"  Est. Traditional: {format_time(est_traditional)}")

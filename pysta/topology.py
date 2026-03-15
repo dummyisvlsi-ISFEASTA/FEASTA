@@ -1,11 +1,4 @@
-"""
-PySTA Topology Builder
-
-Constructs graph structures from arc data:
-- CSR sparse matrices for efficient traversal
-- Cycle detection via Kahn's algorithm
-- Logic depth computation via BFS
-"""
+"""Build adjacency and traversal structures from FEASTA arc data."""
 
 from typing import Dict, List, Optional, Set, Tuple
 from collections import deque
@@ -14,51 +7,19 @@ import pandas as pd
 import numpy as np
 from scipy import sparse
 
-
-# =============================================================================
-# TOPOLOGY BUILDER CLASS
-# =============================================================================
-
 class TopologyBuilder:
-    """
-    Builds graph topology structures from arc data.
-    
-    Provides:
-    - CSR sparse matrices for O(degree) adjacency queries
-    - Cycle detection to identify feedback loops
-    - Logic depth computation (stages from inputs/to outputs)
-    """
+    """Graph topology derived from the arc table."""
     
     def __init__(self, num_nodes: int):
-        """
-        Initialize topology builder.
-        
-        Parameters
-        ----------
-        num_nodes : int
-            Total number of nodes in the design.
-        """
         self.num_nodes = num_nodes
-        
-        # Adjacency matrices (built by build_adjacency)
         self.forward_adj: Optional[sparse.csr_matrix] = None
         self.backward_adj: Optional[sparse.csr_matrix] = None
-        
-        # Edge attributes (parallel arrays)
         self.edge_delays: Optional[np.ndarray] = None
         self.edge_types: Optional[np.ndarray] = None
-        
-        # Cycle info
         self.has_cycles: bool = False
         self.cycle_breaking_points: Set[Tuple[int, int]] = set()
-        
-        # Logic depth
         self.depth_from_input: Optional[np.ndarray] = None
         self.depth_to_output: Optional[np.ndarray] = None
-    
-    # =========================================================================
-    # ADJACENCY CONSTRUCTION
-    # =========================================================================
     
     def build_adjacency(
         self,
@@ -68,27 +29,7 @@ class TopologyBuilder:
         delay_col: str = "Delay",
         type_col: str = "ArcType"
     ) -> Tuple[sparse.csr_matrix, sparse.csr_matrix]:
-        """
-        Build CSR adjacency matrices from arc DataFrame.
-        
-        Parameters
-        ----------
-        arcs_df : pd.DataFrame
-            Arc data with source/sink columns.
-        source_col : str
-            Column name for source node IDs.
-        sink_col : str
-            Column name for sink node IDs.
-        delay_col : str
-            Column name for edge delays.
-        type_col : str
-            Column name for arc types.
-            
-        Returns
-        -------
-        tuple
-            (forward_csr, backward_csr) adjacency matrices.
-        """
+        """Build forward and backward CSR adjacency matrices."""
         if arcs_df is None or arcs_df.empty:
             # Empty graph
             self.forward_adj = sparse.csr_matrix((self.num_nodes, self.num_nodes))
@@ -118,8 +59,7 @@ class TopologyBuilder:
         
         # Edge weights (use 1.0 if delay not available)
         if delay_col in valid_arcs.columns:
-            delays = valid_arcs[delay_col].values[valid_idx]
-            delays = np.nan_to_num(delays, nan=0.0).astype(np.float32)
+            delays = valid_arcs[delay_col].astype(float).fillna(0.0).values[valid_idx].astype(np.float32)
         else:
             delays = np.ones(num_edges, dtype=np.float32)
         
@@ -142,34 +82,17 @@ class TopologyBuilder:
         
         return self.forward_adj, self.backward_adj
     
-    # =========================================================================
-    # CYCLE DETECTION
-    # =========================================================================
-    
     def detect_cycles(self) -> Tuple[bool, Set[Tuple[int, int]]]:
-        """
-        Detect cycles using Kahn's topological sort algorithm.
-        
-        If cycles exist, identifies back-edges (cycle breaking points).
-        
-        Returns
-        -------
-        tuple
-            (has_cycles: bool, breaking_points: Set[Tuple[source, sink]])
-        """
+        """Detect cycles and record edges that participate in them."""
         if self.forward_adj is None:
             return False, set()
         
-        # Compute in-degree for each node
         in_degree = np.array(self.forward_adj.sum(axis=0)).flatten().astype(int)
-        
-        # Queue of nodes with zero in-degree
         queue = deque()
         for node in range(self.num_nodes):
             if in_degree[node] == 0:
                 queue.append(node)
         
-        # Process nodes in topological order
         processed = 0
         visited = set()
         
@@ -178,7 +101,6 @@ class TopologyBuilder:
             visited.add(node)
             processed += 1
             
-            # Get all outgoing edges
             row = self.forward_adj.getrow(node)
             successors = row.indices
             
@@ -187,24 +109,16 @@ class TopologyBuilder:
                 if in_degree[succ] == 0:
                     queue.append(succ)
         
-        # If not all nodes processed, there are cycles
         self.has_cycles = processed < self.num_nodes
-        
         if self.has_cycles:
-            # Find back-edges (edges from unvisited to visited or within cycle)
             unvisited = set(range(self.num_nodes)) - visited
             
             for node in unvisited:
                 row = self.forward_adj.getrow(node)
                 for succ in row.indices:
-                    # This is a potential cycle edge
                     self.cycle_breaking_points.add((node, succ))
         
         return self.has_cycles, self.cycle_breaking_points
-    
-    # =========================================================================
-    # LOGIC DEPTH COMPUTATION
-    # =========================================================================
     
     def compute_logic_depth(
         self,
@@ -212,31 +126,13 @@ class TopologyBuilder:
         port_col: str = "IsPort",
         direction_col: str = "Direction"
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute logic depth from inputs and to outputs using BFS.
-        
-        Parameters
-        ----------
-        nodes_df : pd.DataFrame
-            Node data with port and direction info.
-        port_col : str
-            Column indicating if node is a port.
-        direction_col : str
-            Column indicating port direction.
-            
-        Returns
-        -------
-        tuple
-            (depth_from_input, depth_to_output) arrays.
-        """
-        # Initialize depths to -1 (unknown)
+        """Compute BFS depth from inputs and to outputs."""
         self.depth_from_input = np.full(self.num_nodes, -1, dtype=np.int32)
         self.depth_to_output = np.full(self.num_nodes, -1, dtype=np.int32)
         
         if self.forward_adj is None or nodes_df is None:
             return self.depth_from_input, self.depth_to_output
         
-        # Identify input and output ports
         input_ports = set()
         output_ports = set()
         
@@ -252,8 +148,6 @@ class TopologyBuilder:
                     elif "output" in direction or "out" == direction:
                         output_ports.add(node_id)
         
-        # If no ports identified, use nodes with no predecessors as inputs
-        # and nodes with no successors as outputs
         if not input_ports:
             in_degree = np.array(self.backward_adj.sum(axis=1)).flatten()
             input_ports = set(np.where(in_degree == 0)[0])
@@ -262,14 +156,12 @@ class TopologyBuilder:
             out_degree = np.array(self.forward_adj.sum(axis=1)).flatten()
             output_ports = set(np.where(out_degree == 0)[0])
         
-        # BFS from input ports (forward)
         self._bfs_depth(
             start_nodes=input_ports,
             adj_matrix=self.forward_adj,
             depth_array=self.depth_from_input
         )
         
-        # BFS from output ports (backward)
         self._bfs_depth(
             start_nodes=output_ports,
             adj_matrix=self.backward_adj,
@@ -284,14 +176,8 @@ class TopologyBuilder:
         adj_matrix: sparse.csr_matrix,
         depth_array: np.ndarray
     ):
-        """
-        BFS to compute depth from start nodes.
-        
-        Time complexity: O(V + E)
-        """
+        """Run BFS from a seed set and write depths into `depth_array`."""
         queue = deque()
-        
-        # Initialize start nodes at depth 0
         for node in start_nodes:
             if 0 <= node < self.num_nodes:
                 depth_array[node] = 0
@@ -302,7 +188,6 @@ class TopologyBuilder:
         while queue:
             node, depth = queue.popleft()
             
-            # Get successors
             row = adj_matrix.getrow(node)
             successors = row.indices
             
@@ -311,10 +196,6 @@ class TopologyBuilder:
                     visited.add(succ)
                     depth_array[succ] = depth + 1
                     queue.append((succ, depth + 1))
-    
-    # =========================================================================
-    # TRAVERSAL HELPERS
-    # =========================================================================
     
     def get_fanout(self, node_id: int) -> np.ndarray:
         """Get all direct fanout nodes (successors)."""
@@ -358,7 +239,6 @@ class TopologyBuilder:
             
             successors = self.get_fanout(current)
             for succ in successors:
-                # Skip cycle breaking points
                 if (current, succ) in self.cycle_breaking_points:
                     continue
                 
@@ -388,7 +268,6 @@ class TopologyBuilder:
             
             predecessors = self.get_fanin(current)
             for pred in predecessors:
-                # Skip cycle breaking points
                 if (pred, current) in self.cycle_breaking_points:
                     continue
                 
@@ -397,10 +276,6 @@ class TopologyBuilder:
                     queue.append((pred, depth + 1))
         
         return result
-    
-    # =========================================================================
-    # SUMMARY
-    # =========================================================================
     
     def get_stats(self) -> Dict:
         """Get topology statistics."""
@@ -414,42 +289,18 @@ class TopologyBuilder:
         }
         return stats
 
-
-# =============================================================================
-# HELPER FUNCTIONS
-# =============================================================================
-
 def build_topology(
     nodes_df: pd.DataFrame,
     arcs_df: pd.DataFrame
 ) -> TopologyBuilder:
-    """
-    Convenience function to build complete topology.
-    
-    Parameters
-    ----------
-    nodes_df : pd.DataFrame
-        Node data.
-    arcs_df : pd.DataFrame
-        Arc data.
-        
-    Returns
-    -------
-    TopologyBuilder
-        Fully initialized topology builder.
-    """
+    """Build adjacency, cycle information, and depth annotations."""
     num_nodes = len(nodes_df) if nodes_df is not None else 0
     
     builder = TopologyBuilder(num_nodes)
     
-    # Build adjacency
     if arcs_df is not None and not arcs_df.empty:
         builder.build_adjacency(arcs_df)
-    
-    # Detect cycles
     builder.detect_cycles()
-    
-    # Compute logic depth
     if nodes_df is not None:
         builder.compute_logic_depth(nodes_df)
     

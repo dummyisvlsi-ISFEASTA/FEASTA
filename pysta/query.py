@@ -1,9 +1,4 @@
-"""
-PySTA Query Engine
-
-High-performance query engine for filtering, traversal, and aggregation.
-Uses Django-style operators for intuitive filtering.
-"""
+"""Query helpers over loaded FEASTA data."""
 
 import re
 import operator
@@ -13,11 +8,6 @@ import pandas as pd
 import numpy as np
 
 from .topology import TopologyBuilder
-
-
-# =============================================================================
-# OPERATOR MAPPINGS
-# =============================================================================
 
 OPERATORS = {
     "lt": operator.lt,
@@ -35,26 +25,8 @@ STRING_OPERATORS = {
     "regex": lambda s, v: s.str.contains(v, na=False, regex=True),
 }
 
-
-# =============================================================================
-# QUERY ENGINE CLASS
-# =============================================================================
-
 class QueryEngine:
-    """
-    High-performance query engine for circuit data.
-    
-    Supports:
-    - Django-style filtering (e.g., SlackWorst_ns__lt=0)
-    - Graph traversal (fanin, fanout)
-    - Critical path extraction
-    - Aggregation
-    
-    Example:
-        >>> qe = QueryEngine(design.nodes, design.topology)
-        >>> violations = qe.filter(SlackWorst_ns__lt=0)
-        >>> fanout = qe.get_fanout("reg/Q", depth=3)
-    """
+    """Filtering and traversal over a DataFrame plus optional topology."""
     
     def __init__(
         self,
@@ -63,64 +35,13 @@ class QueryEngine:
         name_to_id: Optional[Dict[str, int]] = None,
         id_to_name: Optional[Dict[int, str]] = None
     ):
-        """
-        Initialize query engine.
-        
-        Parameters
-        ----------
-        df : pd.DataFrame
-            Data to query (nodes, cells, or arcs).
-        topology : TopologyBuilder, optional
-            Topology for graph traversal.
-        name_to_id : dict, optional
-            Name to integer ID mapping.
-        id_to_name : dict, optional
-            Integer ID to name mapping.
-        """
         self._df = df
         self._topology = topology
         self._name_to_id = name_to_id or {}
         self._id_to_name = id_to_name or {}
     
-    # =========================================================================
-    # FILTERING
-    # =========================================================================
-    
     def filter(self, **conditions) -> pd.DataFrame:
-        """
-        Filter data using Django-style conditions.
-        
-        Parameters
-        ----------
-        **conditions
-            Keyword arguments in format: column__operator=value
-            
-            Operators:
-                __lt    : Less than
-                __lte   : Less than or equal
-                __gt    : Greater than
-                __gte   : Greater than or equal
-                __eq    : Equal (default if no operator)
-                __ne    : Not equal
-                __in    : In list
-                __nin   : Not in list
-                __contains : String contains
-                __startswith : String starts with
-                __endswith : String ends with
-                __regex : Regular expression match
-                __isnull : Is null/NaN
-                
-        Returns
-        -------
-        pd.DataFrame
-            Filtered results.
-            
-        Examples
-        --------
-        >>> qe.filter(SlackWorst_ns__lt=0)                # Violations
-        >>> qe.filter(IsClock=True, Capacitance_pf__gt=0.5)  # High-cap clocks
-        >>> qe.filter(Direction__in=["input", "output"])  # Ports only
-        """
+        """Filter rows with `column__op=value` conditions."""
         if self._df is None or self._df.empty:
             return pd.DataFrame()
         
@@ -139,14 +60,12 @@ class QueryEngine:
     
     def _parse_condition(self, key: str) -> Tuple[str, str]:
         """Parse condition key into column and operator."""
-        # Check for double-underscore operator
         for op in list(OPERATORS.keys()) + list(STRING_OPERATORS.keys()) + ["in", "nin", "isnull"]:
             suffix = f"__{op}"
             if key.endswith(suffix):
                 col = key[:-len(suffix)]
                 return col, op
         
-        # No operator = equality
         return key, "eq"
     
     def _apply_operator(self, series: pd.Series, op: str, value: Any) -> pd.Series:
@@ -169,27 +88,10 @@ class QueryEngine:
             else:
                 return series.notna()
         
-        # Default: equality
         return series == value
     
-    # =========================================================================
-    # POINT QUERY
-    # =========================================================================
-    
     def get(self, name: str) -> Optional[pd.Series]:
-        """
-        Get single row by name (O(1) lookup).
-        
-        Parameters
-        ----------
-        name : str
-            Node/cell name.
-            
-        Returns
-        -------
-        pd.Series or None
-            Row data if found, None otherwise.
-        """
+        """Return one row by name if present."""
         if name not in self._name_to_id:
             return None
         
@@ -207,33 +109,13 @@ class QueryEngine:
         
         return matches.iloc[0]
     
-    # =========================================================================
-    # GRAPH TRAVERSAL
-    # =========================================================================
-    
     def get_fanout(
         self,
         node_name: str,
         depth: int = 1,
         include_properties: bool = True
     ) -> pd.DataFrame:
-        """
-        Get fanout cone from a node.
-        
-        Parameters
-        ----------
-        node_name : str
-            Starting node name.
-        depth : int, default=1
-            Number of hops to traverse.
-        include_properties : bool, default=True
-            Include full node properties in result.
-            
-        Returns
-        -------
-        pd.DataFrame
-            Fanout nodes with depth column.
-        """
+        """Return the fanout cone from `node_name` up to `depth` hops."""
         if self._topology is None:
             return pd.DataFrame()
         
@@ -242,13 +124,11 @@ class QueryEngine:
         
         node_id = self._name_to_id[node_name]
         
-        # Get fanout with depth
         fanout_dict = self._topology.get_fanout_depth(node_id, max_depth=depth)
         
         if not fanout_dict:
             return pd.DataFrame()
         
-        # Build result DataFrame
         result_data = []
         for nid, d in fanout_dict.items():
             name = self._id_to_name.get(nid, f"node_{nid}")
@@ -256,7 +136,6 @@ class QueryEngine:
         
         result = pd.DataFrame(result_data)
         
-        # Merge with properties if requested
         if include_properties and self._df is not None:
             result = result.merge(
                 self._df.drop(columns=["Depth"], errors="ignore"),
@@ -273,23 +152,7 @@ class QueryEngine:
         depth: int = 1,
         include_properties: bool = True
     ) -> pd.DataFrame:
-        """
-        Get fanin cone to a node.
-        
-        Parameters
-        ----------
-        node_name : str
-            Target node name.
-        depth : int, default=1
-            Number of hops to traverse backward.
-        include_properties : bool, default=True
-            Include full node properties in result.
-            
-        Returns
-        -------
-        pd.DataFrame
-            Fanin nodes with depth column.
-        """
+        """Return the fanin cone to `node_name` up to `depth` hops."""
         if self._topology is None:
             return pd.DataFrame()
         
@@ -298,13 +161,11 @@ class QueryEngine:
         
         node_id = self._name_to_id[node_name]
         
-        # Get fanin with depth
         fanin_dict = self._topology.get_fanin_depth(node_id, max_depth=depth)
         
         if not fanin_dict:
             return pd.DataFrame()
         
-        # Build result DataFrame
         result_data = []
         for nid, d in fanin_dict.items():
             name = self._id_to_name.get(nid, f"node_{nid}")
@@ -312,7 +173,6 @@ class QueryEngine:
         
         result = pd.DataFrame(result_data)
         
-        # Merge with properties if requested
         if include_properties and self._df is not None:
             result = result.merge(
                 self._df.drop(columns=["Depth"], errors="ignore"),
@@ -323,45 +183,19 @@ class QueryEngine:
         
         return result.sort_values("Depth")
     
-    # =========================================================================
-    # CRITICAL PATHS
-    # =========================================================================
-    
     def get_critical_paths(
         self,
         top_k: int = 10,
         slack_column: str = "SlackWorst_ns",
         max_stages: int = 100
     ) -> List[Dict]:
-        """
-        Find top-K critical timing paths.
-        
-        Parameters
-        ----------
-        top_k : int, default=10
-            Number of paths to return.
-        slack_column : str, default="SlackWorst_ns"
-            Column to use for slack.
-        max_stages : int, default=100
-            Maximum path length.
-            
-        Returns
-        -------
-        List[Dict]
-            Each dict contains:
-            - endpoint: str
-            - startpoint: str
-            - slack: float
-            - stages: int
-            - path: List[str]
-        """
+        """Trace back from the worst-slack endpoints and return up to `top_k` paths."""
         if self._df is None or self._topology is None:
             return []
         
         if slack_column not in self._df.columns:
             return []
         
-        # Get nodes sorted by worst slack
         slack_df = self._df[self._df[slack_column].notna()].copy()
         slack_df = slack_df.sort_values(slack_column)
         
@@ -381,7 +215,6 @@ class QueryEngine:
             
             seen_endpoints.add(endpoint_name)
             
-            # Trace back to find startpoint
             path_ids = self._trace_back(endpoint_id, max_stages)
             
             if path_ids:
@@ -397,6 +230,36 @@ class QueryEngine:
                 })
         
         return paths
+
+    def get_paths_between(
+        self,
+        startpoint: str,
+        endpoint: str,
+        top_k: int = 1,
+        max_stages: int = 100
+    ) -> List[Dict]:
+        """Return up to `top_k` simple paths from `startpoint` to `endpoint`."""
+        if self._topology is None:
+            return []
+
+        start_id = self._name_to_id.get(startpoint)
+        end_id = self._name_to_id.get(endpoint)
+        if start_id is None or end_id is None:
+            return []
+
+        path_ids = self._enumerate_paths(start_id, end_id, top_k, max_stages)
+        results = []
+        for ids in path_ids:
+            path_names = [self._id_to_name.get(nid, f"node_{nid}") for nid in ids]
+            results.append(
+                {
+                    "startpoint": startpoint,
+                    "endpoint": endpoint,
+                    "stages": len(ids) - 1,
+                    "path": path_names,
+                }
+            )
+        return results
     
     def _trace_back(self, endpoint_id: int, max_stages: int) -> List[int]:
         """Trace back from endpoint to find critical path."""
@@ -413,7 +276,6 @@ class QueryEngine:
             if len(predecessors) == 0:
                 break
             
-            # Filter out cycle breaking points
             valid_preds = [
                 p for p in predecessors 
                 if (p, current) not in self._topology.cycle_breaking_points
@@ -423,37 +285,60 @@ class QueryEngine:
             if not valid_preds:
                 break
             
-            # Take first predecessor (could be improved with delay-based selection)
             next_node = valid_preds[0]
             visited.add(next_node)
             path.insert(0, next_node)
             current = next_node
         
         return path
-    
-    # =========================================================================
-    # AGGREGATION
-    # =========================================================================
+
+    def _enumerate_paths(
+        self,
+        start_id: int,
+        end_id: int,
+        top_k: int,
+        max_stages: int
+    ) -> List[List[int]]:
+        """Enumerate up to `top_k` simple forward paths from `start_id` to `end_id`."""
+        if self._topology is None:
+            return []
+
+        if start_id == end_id:
+            return [[start_id]]
+
+        paths: List[List[int]] = []
+        stack: List[Tuple[int, List[int], Set[int]]] = [(start_id, [start_id], {start_id})]
+
+        while stack and len(paths) < top_k:
+            current, path, visited = stack.pop()
+            if len(path) - 1 >= max_stages:
+                continue
+
+            successors = self._topology.get_fanout(current)
+            if len(successors) == 0:
+                continue
+
+            next_nodes = []
+            for succ in successors:
+                if (current, succ) in self._topology.cycle_breaking_points:
+                    continue
+                if succ in visited:
+                    continue
+                next_nodes.append(int(succ))
+
+            for succ in reversed(next_nodes):
+                next_path = path + [succ]
+                if succ == end_id:
+                    paths.append(next_path)
+                    if len(paths) >= top_k:
+                        break
+                    continue
+                stack.append((succ, next_path, visited | {succ}))
+
+        return paths
     
     def agg(self, aggregations: Dict[str, str]) -> pd.Series:
-        """
-        Aggregate data.
-        
-        Parameters
-        ----------
-        aggregations : dict
-            Column -> aggregation function mapping.
-            Functions: "sum", "mean", "min", "max", "count", "std"
-            
-        Returns
-        -------
-        pd.Series
-            Aggregation results.
-            
-        Example
-        -------
-        >>> qe.filter(IsClock=True).agg({"Capacitance_pf": "sum"})
-        """
+        """Apply simple pandas aggregations keyed by column name."""
         if self._df is None or self._df.empty:
             return pd.Series()
         
@@ -464,30 +349,12 @@ class QueryEngine:
         
         return pd.Series(results)
     
-    # =========================================================================
-    # SUBGRAPH EXTRACTION
-    # =========================================================================
-    
     def extract_subgraph(
         self,
         center_node: str,
         hops: int = 2
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Extract subgraph around a center node.
-        
-        Parameters
-        ----------
-        center_node : str
-            Center node name.
-        hops : int, default=2
-            Radius in hops.
-            
-        Returns
-        -------
-        tuple
-            (nodes_df, arcs_df) for the subgraph.
-        """
+        """Return the nodes and arcs within `hops` of `center_node`."""
         if self._topology is None:
             return pd.DataFrame(), pd.DataFrame()
         
@@ -496,35 +363,30 @@ class QueryEngine:
         
         center_id = self._name_to_id[center_node]
         
-        # Get all nodes within hops
         fanin = self._topology.get_fanin_depth(center_id, max_depth=hops)
         fanout = self._topology.get_fanout_depth(center_id, max_depth=hops)
         
         all_nodes = set(fanin.keys()) | set(fanout.keys())
         
-        # Filter nodes DataFrame
         if "_node_id" in self._df.columns:
             subgraph_nodes = self._df[self._df["_node_id"].isin(all_nodes)].copy()
         else:
-            node_names = [self._id_to_name.get(nid, "") for nid in all_nodes]
+            node_names = {self._id_to_name.get(nid, "") for nid in all_nodes}
             subgraph_nodes = self._df[self._df["Name"].isin(node_names)].copy()
-        
-        # Arcs would need to be filtered separately (not implemented here)
+
         subgraph_arcs = pd.DataFrame()
-        
+        if self._topology is not None:
+            src_col = "_source_id" if "_source_id" in self._df.columns else None
+            snk_col = "_sink_id" if "_sink_id" in self._df.columns else None
+            if src_col and snk_col:
+                subgraph_arcs = self._df[
+                    self._df[src_col].isin(all_nodes) & self._df[snk_col].isin(all_nodes)
+                ].copy()
+
         return subgraph_nodes, subgraph_arcs
 
-
-# =============================================================================
-# FILTERABLE DATAFRAME WRAPPER
-# =============================================================================
-
 class FilterableDataFrame:
-    """
-    Wrapper that adds filter method to DataFrame.
-    
-    Allows: design.pins.filter(SlackWorst_ns__lt=0)
-    """
+    """Thin wrapper that forwards query helpers to a DataFrame."""
     
     def __init__(
         self,
@@ -537,7 +399,7 @@ class FilterableDataFrame:
         self._qe = QueryEngine(df, topology, name_to_id, id_to_name)
     
     def filter(self, **conditions) -> pd.DataFrame:
-        """Filter using Django-style conditions."""
+        """Filter rows."""
         return self._qe.filter(**conditions)
     
     def get(self, name: str) -> Optional[pd.Series]:
@@ -551,6 +413,16 @@ class FilterableDataFrame:
     def get_fanin(self, node_name: str, depth: int = 1) -> pd.DataFrame:
         """Get fanin cone."""
         return self._qe.get_fanin(node_name, depth)
+
+    def get_paths_between(
+        self,
+        startpoint: str,
+        endpoint: str,
+        top_k: int = 1,
+        max_stages: int = 100
+    ) -> List[Dict]:
+        """Get paths between two nodes."""
+        return self._qe.get_paths_between(startpoint, endpoint, top_k, max_stages)
     
     def get_critical_paths(self, top_k: int = 10) -> List[Dict]:
         """Get critical paths."""
@@ -560,7 +432,6 @@ class FilterableDataFrame:
         """Aggregate data."""
         return self._qe.agg(aggregations)
     
-    # Delegate DataFrame methods
     def __getattr__(self, name):
         return getattr(self._df, name)
     

@@ -72,6 +72,7 @@ message(STATUS "Install prefix: ${CMAKE_INSTALL_PREFIX}")
 set(STA_SOURCE
   app/StaMain.cc
   csv/csvWriter.cc
+  csv/SpefParser.cc
   dcalc/ArcDelayCalc.cc
   dcalc/ArcDcalcWaveforms.cc
   dcalc/ArnoldiDelayCalc.cc

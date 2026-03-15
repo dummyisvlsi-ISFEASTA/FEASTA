@@ -1,20 +1,10 @@
-"""
-PySTA Utility Functions
-
-Shared utilities for schema validation, type casting, and error handling.
-"""
+"""Shared schema, typing, and indexing helpers for PySTA."""
 
 from typing import Dict, List, Optional, Set
 import pandas as pd
 import numpy as np
 
-
-# =============================================================================
-# SCHEMA DEFINITIONS
-# =============================================================================
-
-# Expected columns for each CSV file
-# Expected columns for each CSV file
+# Expected columns for each CSV file.
 SCHEMA = {
     "network_nodes": {
         "required": ["Name", "InstanceName", "PinName", "Direction"],
@@ -34,7 +24,8 @@ SCHEMA = {
         "optional": [
             "NetName", "Connection", "ArcType",
             "Delay_Min_RR", "Delay_Min_RF", "Delay_Min_FR", "Delay_Min_FF",
-            "Delay_Max_RR", "Delay_Max_RF", "Delay_Max_FR", "Delay_Max_FF"
+            "Delay_Max_RR", "Delay_Max_RF", "Delay_Max_FR", "Delay_Max_FF",
+            "InputTransition_ns", "OutputLoad_pf"
         ],
         "types": {
             "Source": str,
@@ -43,7 +34,8 @@ SCHEMA = {
             "Connection": "category",
             "ArcType": "category",
             "Delay_Min_RR": np.float32, "Delay_Min_RF": np.float32, "Delay_Min_FR": np.float32, "Delay_Min_FF": np.float32,
-            "Delay_Max_RR": np.float32, "Delay_Max_RF": np.float32, "Delay_Max_FR": np.float32, "Delay_Max_FF": np.float32
+            "Delay_Max_RR": np.float32, "Delay_Max_RF": np.float32, "Delay_Max_FR": np.float32, "Delay_Max_FF": np.float32,
+            "InputTransition_ns": np.float32, "OutputLoad_pf": np.float32
         }
     },
     "pin_properties": {
@@ -113,16 +105,26 @@ SCHEMA = {
             "PinCount": np.int32,
             "InputPinCount": np.int32,
             "OutputPinCount": np.int32,
+            "BiDirectPinCount": np.int32,
+            "ClockPinCount": np.int32,
+            "DataPinCount": np.int32,
+            "AsyncPinCount": np.int32,
             "FanoutLoad": np.int32,
-            "FaninLoad": np.int32
+            "FaninLoad": np.int32,
+            "IsCombinational": bool,
+            "IsSequential": bool,
+            "IsClockGating": bool,
+            "SetupTime_ns": np.float32,
+            "HoldTime_ns": np.float32,
+            "TimingArcCount": np.int32,
+            "HasClockInput": bool,
+            "ClockDomains": str,
+            "Process": np.float32,
+            "Voltage_V": np.float32,
+            "Temperature_C": np.float32
         }
     }
 }
-
-
-# =============================================================================
-# CUSTOM EXCEPTIONS
-# =============================================================================
 
 class PySTA_Error(Exception):
     """Base exception for PySTA."""
@@ -138,32 +140,20 @@ class LoadError(PySTA_Error):
     """Raised when CSV loading fails."""
     pass
 
-
-# =============================================================================
-# SCHEMA VALIDATION
-# =============================================================================
-
 def validate_schema(df: pd.DataFrame, schema_name: str, filepath: str) -> List[str]:
-    """
-    Validate DataFrame against expected schema.
-    
-    Returns list of warnings (empty if all good).
-    Raises SchemaError if required columns missing.
-    """
+    """Validate a DataFrame against one of the built-in schemas."""
     if schema_name not in SCHEMA:
         raise ValueError(f"Unknown schema: {schema_name}")
     
     schema = SCHEMA[schema_name]
     warnings = []
     
-    # Check required columns
     missing_required = set(schema["required"]) - set(df.columns)
     if missing_required:
         raise SchemaError(
             f"Missing required columns in {filepath}: {missing_required}"
         )
     
-    # Check optional columns (warn if missing)
     missing_optional = set(schema["optional"]) - set(df.columns)
     if missing_optional:
         warnings.append(
@@ -172,17 +162,8 @@ def validate_schema(df: pd.DataFrame, schema_name: str, filepath: str) -> List[s
     
     return warnings
 
-
-# =============================================================================
-# TYPE CASTING
-# =============================================================================
-
 def cast_types(df: pd.DataFrame, schema_name: str) -> pd.DataFrame:
-    """
-    Cast DataFrame columns to appropriate types.
-    Uses float32 for numerics (memory optimization).
-    Uses categorical for low-cardinality strings.
-    """
+    """Cast known columns to the schema's preferred dtypes."""
     if schema_name not in SCHEMA:
         return df
     
@@ -196,7 +177,6 @@ def cast_types(df: pd.DataFrame, schema_name: str) -> pd.DataFrame:
             if dtype == "category":
                 df[col] = df[col].astype("category")
             elif dtype == bool:
-                # Handle various bool representations
                 df[col] = df[col].map(
                     lambda x: str(x).lower() in ("true", "1", "yes") if pd.notna(x) else False
                 )
@@ -207,33 +187,17 @@ def cast_types(df: pd.DataFrame, schema_name: str) -> pd.DataFrame:
             else:
                 df[col] = df[col].astype(dtype, errors="ignore")
         except Exception:
-            pass  # Keep original type if casting fails
+            pass
     
     return df
 
-
-# =============================================================================
-# INDEX BUILDING
-# =============================================================================
-
 def build_name_index(names: pd.Series) -> tuple:
-    """
-    Build bidirectional name index for O(1) lookups.
-    
-    Returns:
-        name_to_id: Dict[str, int]
-        id_to_name: Dict[int, str]
-    """
+    """Build forward and reverse indices for node names."""
     unique_names = names.unique()
     name_to_id = {name: idx for idx, name in enumerate(unique_names)}
     id_to_name = {idx: name for idx, name in enumerate(unique_names)}
     
     return name_to_id, id_to_name
-
-
-# =============================================================================
-# ZERO-COPY DATA ASSIGNMENT
-# =============================================================================
 
 def merge_by_index(
     master_df: pd.DataFrame,
@@ -322,11 +286,6 @@ def fast_merge_by_index(
         return result
     
     return master_df
-
-
-# =============================================================================
-# MEMORY UTILITIES
-# =============================================================================
 
 def get_memory_usage(df: pd.DataFrame) -> float:
     """Get DataFrame memory usage in MB."""

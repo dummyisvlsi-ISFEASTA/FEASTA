@@ -11,31 +11,40 @@ import random
 import os
 import sys
 import time
+import numpy as np
 
 # Add PySTA to path
-sys.path.insert(0, '/home/aaditya/OpenSTA_new')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pysta import Design
 
 random.seed(8026728)
 
 # Default path to ZipCPU CSVs
-DEFAULT_PYSTA_PATH = '/DATA2/sagar/opensta_tb/zipcpu'
+DEFAULT_PYSTA_PATH = './data/zipcpu'
+DELAY_COLS = ['Delay_Max_RR', 'Delay_Max_RF', 'Delay_Max_FR', 'Delay_Max_FF']
+EDGE_FEATURE_COLS = ['InputTransition_ns', 'OutputLoad_pf']
+LOG_EPS = 1e-4
+LOG_SHIFT = 9.211
 
 
-def pysta_to_dgl_graph(design, device='cuda'):
+def pysta_to_dgl_graph(design, device='cuda', min_delay_ns=0.0, verbose=True):
     """
     Convert PySTA Design to DGL heterograph (same format as CircuitNet).
     
     Returns a graph with:
     - Node features 'nf': [x, y, capacitance, slew] (4D)
-    - Edge data 'net_delay': delay values
+    - Edge data 'net_delay': raw delay values
+    - Edge data 'ef': [input_transition, output_load]
     """
-    import numpy as np
-    
     nodes_df = design.nodes
     arcs_df = design.arcs
-    
-    print(f"  Nodes: {len(nodes_df)}, Arcs: {len(arcs_df)}")
+
+    # Predict only net arcs for the graph task.
+    if 'ArcType' in arcs_df.columns:
+        arcs_df = arcs_df[arcs_df['ArcType'] == 'net_arc'].copy()
+
+    if verbose:
+        print(f"  Nodes: {len(nodes_df)}, Arcs: {len(arcs_df)}")
     
     # Build node index
     name_to_idx = {name: i for i, name in enumerate(nodes_df['Name'])}
@@ -67,41 +76,49 @@ def pysta_to_dgl_graph(design, device='cuda'):
     slew = np.log1p(np.abs(slew))
     
     node_features = np.stack([x_coords, y_coords, capacitance, slew], axis=1)
-    print(f"  Node features shape: {node_features.shape}")
+    if verbose:
+        print(f"  Node features shape: {node_features.shape}")
     
-    # Build edges from arcs
-    src_names = arcs_df['Source'].values
-    sink_names = arcs_df['Sink'].values
-    
-    # Handle pyarrow arrays
-    if hasattr(src_names, 'to_numpy'):
-        src_names = src_names.to_numpy()
-    if hasattr(sink_names, 'to_numpy'):
-        sink_names = sink_names.to_numpy()
-    
-    src_ids = []
-    sink_ids = []
-    valid_indices = []
-    
-    for i, (src, sink) in enumerate(zip(src_names, sink_names)):
-        if src in name_to_idx and sink in name_to_idx:
-            src_ids.append(name_to_idx[src])
-            sink_ids.append(name_to_idx[sink])
-            valid_indices.append(i)
-    
-    src_ids = np.array(src_ids, dtype=np.int64)
-    sink_ids = np.array(sink_ids, dtype=np.int64)
-    
-    print(f"  Valid edges: {len(src_ids)} / {len(arcs_df)}")
-    
-    # Get delay values
-    if 'Delay' in arcs_df.columns:
-        delays = arcs_df['Delay'].fillna(0.0).values
-        if hasattr(delays, 'to_numpy'):
-            delays = delays.to_numpy()
-        delays = delays[valid_indices].astype(np.float32)
+    arcs = arcs_df.copy()
+
+    if '_source_id' in arcs.columns and '_sink_id' in arcs.columns:
+        arcs['_src'] = arcs['_source_id']
+        arcs['_snk'] = arcs['_sink_id']
     else:
-        delays = np.zeros(len(src_ids), dtype=np.float32)
+        arcs['_src'] = arcs['Source'].map(name_to_idx)
+        arcs['_snk'] = arcs['Sink'].map(name_to_idx)
+
+    arcs = arcs.dropna(subset=['_src', '_snk'])
+
+    import pandas as pd
+    available_delay_cols = [c for c in DELAY_COLS if c in arcs.columns]
+    if not available_delay_cols:
+        raise ValueError("No delay columns found in network_arcs.csv")
+
+    for col in available_delay_cols:
+        arcs[col] = pd.to_numeric(arcs[col], errors='coerce')
+    arcs['_delay_ns'] = arcs[available_delay_cols].max(axis=1).fillna(0.0).astype(np.float32)
+
+    if min_delay_ns > 0.0:
+        arcs = arcs[arcs['_delay_ns'] >= float(min_delay_ns)].copy()
+
+    src_ids = arcs['_src'].astype(np.int64).values
+    sink_ids = arcs['_snk'].astype(np.int64).values
+    delays = arcs['_delay_ns'].values.astype(np.float32)
+
+    edge_features = []
+    for col in EDGE_FEATURE_COLS:
+        if col in arcs.columns:
+            values = pd.to_numeric(arcs[col], errors='coerce').fillna(0.0).values.astype(np.float32)
+        else:
+            values = np.zeros(len(arcs), dtype=np.float32)
+        edge_features.append(values)
+    edge_attr = np.stack(edge_features, axis=1) if len(arcs) else np.zeros((0, len(EDGE_FEATURE_COLS)), dtype=np.float32)
+
+    if verbose:
+        print(f"  Valid edges: {len(src_ids)} / {len(arcs_df)}")
+        if len(delays):
+            print(f"  Delay range: [{delays.min():.6f}, {delays.max():.6f}] ns")
     
     # Create DGL heterograph
     graph_data = {
@@ -117,7 +134,11 @@ def pysta_to_dgl_graph(design, device='cuda'):
     # Add edge data (delay) - must be 2D for CircuitNet compatibility
     delay_tensor = torch.tensor(delays, dtype=torch.float32).unsqueeze(1)
     g.edges['net_out'].data['net_delay'] = delay_tensor
-    
+    g.edges['net_out'].data['net_delays_log'] = torch.log(delay_tensor + LOG_EPS) + LOG_SHIFT
+    edge_tensor = torch.tensor(edge_attr, dtype=torch.float32)
+    g.edges['net_out'].data['ef'] = edge_tensor
+    g.edges['net_in'].data['ef'] = edge_tensor
+
     # Move to device - try CUDA, fall back to CPU
     if device == 'cuda':
         try:
@@ -126,7 +147,8 @@ def pysta_to_dgl_graph(design, device='cuda'):
             print(f"  Warning: Could not move to CUDA ({e}), using CPU")
             device = 'cpu'
     
-    print(f"  Graph: {g.number_of_nodes()} nodes, {g.num_edges('net_out')} edges")
+    if verbose:
+        print(f"  Graph: {g.number_of_nodes()} nodes, {g.num_edges('net_out')} edges")
     
     return g
 
@@ -150,13 +172,13 @@ def load_data(args):
         
         print("[PySTA] Converting to DGL...")
         t0 = time.time()
-        g = pysta_to_dgl_graph(design)
-        print(f"[PySTA] Convert time: {time.time()-t0:.2f}s")
-        
-        # Add log-delay (same transform as original)
-        g.edges['net_out'].data['net_delays_log'] = (
-            torch.log(0.0001 + g.edges['net_out'].data['net_delay']) + 9.211
+        g = pysta_to_dgl_graph(
+            design,
+            device='cuda' if getattr(args, 'device', 'cpu') == 'cuda' else 'cpu',
+            min_delay_ns=getattr(args, 'min_delay_ns', 0.0),
+            verbose=True,
         )
+        print(f"[PySTA] Convert time: {time.time()-t0:.2f}s")
         
         # Create data dict with single design
         data = {'zipcpu': g}

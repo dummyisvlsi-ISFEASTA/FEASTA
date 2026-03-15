@@ -25,24 +25,30 @@ class NetConv(torch.nn.Module):
         self.out_nf = out_nf
         self.h1 = h1
         self.h2 = h2
-        self.MLP_msg_i2o = MLP(self.in_nf * 2 , 32, 32, 32, 1 + self.h1 + self.h2)
+        edge_in = self.in_nf * 2 + self.in_ef
+        self.MLP_msg_i2o = MLP(edge_in, 32, 32, 32, 1 + self.h1 + self.h2)
         self.MLP_reduce_o = MLP(self.in_nf + self.h1 + self.h2, 32, 32, 32, self.out_nf)
-        self.MLP_msg_o2i = MLP(self.in_nf * 2, 32, 32, 32, 32, self.out_nf)
-        self.MLP_readout = MLP(self.in_nf * 2, 32, 32, 32, 32, self.out_nf)
+        self.MLP_msg_o2i = MLP(edge_in, 32, 32, 32, 32, self.out_nf)
+        self.MLP_readout = MLP(edge_in, 32, 32, 32, 32, self.out_nf)
 
+    def _edge_input(self, edges):
+        parts = [edges.src['nf'], edges.dst['nf']]
+        if self.in_ef > 0 and 'ef' in edges.data:
+            parts.append(edges.data['ef'])
+        return torch.cat(parts, dim=1)
 
     def edge_readout(self, edges):
-        x = torch.cat([edges.src['nf'], edges.dst['nf']], dim=1)  # source destination
+        x = self._edge_input(edges)
         x = self.MLP_readout(x)
         return {'nef': x}
     
     def edge_msg_i(self, edges):
-        x = torch.cat([edges.src['nf'], edges.dst['nf']], dim=1)
+        x = self._edge_input(edges)
         x = self.MLP_msg_o2i(x)
         return {'efi': x}
     
     def edge_msg_o(self, edges):
-        x = torch.cat([edges.src['nf'], edges.dst['nf']], dim=1)
+        x = self._edge_input(edges)
         x = self.MLP_msg_i2o(x)
         k, f1, f2 = torch.split(x, [1, self.h1, self.h2], dim=1)
         k = torch.sigmoid(k)
@@ -70,9 +76,9 @@ class NetConv(torch.nn.Module):
 class TimingGCN(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.nc1 = NetConv(4, 0, 16)
-        self.nc2 = NetConv(16, 0, 16)
-        self.nc3 = NetConv(16, 0, 4)
+        self.nc1 = NetConv(4, 2, 16)
+        self.nc2 = NetConv(16, 2, 16)
+        self.nc3 = NetConv(16, 2, 1)
 
     def forward(self, g):
         nf0 = g.ndata['nf']
